@@ -1,44 +1,36 @@
-# Boolean Wire Erasure Experiment Report
+## DLGN Progress and Remaining Challenges
 
-## Method
+The current DLGN has improved through several targeted changes while preserving its rank-2 Boolean/LUT structure and hardware-friendly design. The most successful improvements so far have been the **multi-bit input encoding**, especially quantile-based and hybrid Q+S representations, and **CIFAR random crop + horizontal-flip augmentation**, which produced a clear accuracy improvement. Class-routed dense layers were also explored, although their benefit appears smaller and less consistent.
 
-A **Boolean Wire Erasure** regularizer was added after the first `LogicDense` layer. During training, each activation has a probability of \(p=0.02\) of being replaced by **0.5**, representing an unknown Boolean state. The erasure is disabled during relaxed evaluation, discrete evaluation, and export, so it adds no inference cost.
+The network still follows the same core pipeline:
 
-## Experimental Setup
+**binary encoder → LogicConv layers → LogicDense/class-routed layers → GroupSum classification**
 
-The original model configuration was kept unchanged:
+Several alternatives—including attention, extra convolutional depth, larger widths, random wire erasure, random erasing, and modified dense structures—did not provide reliable gains.
 
-* Model: `build_model_cifar10_smallmodel`
-* Encoding: Q2 + S2 hybrid
-* `k_num = 36`
-* `lut_rank = 2`
-* Parameters: 375,984
-* Learning rate: 0.02, constant
-* End temperature: 0.1
-* Iterations: 57,000
-* Wire erasure probability: \(p=0.02\)
+### LogicConv remains an important research direction
 
-## Preliminary Results
+The **LogicConv layers are not fully solved and may still be a major bottleneck**. In the current implementation, every logic tree uses a small fixed subset of input wires. In the first convolution, this can strongly restrict interaction between different encoded channels such as RGB, quantile, and sine bits.
 
-Up to step 41,000:
+Simply increasing the channel group size did not improve performance, and the first `channel-balanced` experiment also appeared too aggressive: mixing many channels within only eight available tree leaves reduces the amount of spatial information seen from each channel.
 
-* Train relaxed accuracy: **69.42%**
-* Test relaxed accuracy: **65.85%**
-* Test discrete accuracy: **62.51%**
-* Best discrete accuracy so far: **62.58%** at step 26,500
+A more promising direction is therefore to redesign LogicConv connectivity so that each kernel jointly preserves:
 
-The previous baseline without wire erasure reached approximately **63.54%** best discrete accuracy.
+- **spatial structure** inside the receptive field,
+- **cross-channel interaction** between encoded features,
+- **balanced channel usage** across kernels,
+- and the same small rank-2 logic-tree/hardware cost.
 
-## Interpretation
+For example, a kernel could use **two complementary channels across four shared spatial locations**, rather than eight unrelated channels from eight individual pixels.
 
-Wire erasure appears to act as intended as a regularizer by limiting training accuracy while maintaining relatively strong test relaxed accuracy. However, it has **not yet improved discrete test accuracy** over the baseline. The remaining performance limitation appears to be mainly the **relaxed-to-discrete gap**, rather than conventional overfitting.
+### Main remaining challenges
 
-## Next Step
+The highest-priority areas are therefore:
 
-Complete the current run to 57,000 iterations. If the final result remains below the baseline, test a weaker erasure probability such as:
+1. **LogicConv connectivity** — improve channel mixing without destroying spatial structure.
+2. **Generalization / overfitting** — reduce the gap between training and test performance.
+3. **Fixed topology** — investigate whether better or partially learned/stochastic connectivity can outperform one randomly fixed wiring.
+4. **Relaxed-to-discrete gap** — improve conversion from the differentiable training model to the final Boolean network.
+5. **Dense head efficiency** — determine whether the large LogicDense section can be simplified or regularized without reducing accuracy.
 
-$$
-p=0.01
-$$
-
-rather than increasing the regularization strength.
+The most promising current direction is therefore not simply making the DLGN wider or deeper, but improving **how information is connected and composed inside the existing logic gates** while keeping the final network compact and hardware-friendly.
