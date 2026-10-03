@@ -92,6 +92,7 @@ class FixedDenseConnections(Connections):
             lut_rank=2, 
             device=None,
             init_method="random",
+            require_full_coverage=True,
             **kwargs
         ):
         super().__init__(
@@ -102,6 +103,7 @@ class FixedDenseConnections(Connections):
         )
         self.in_dim = in_dim
         self.out_dim = out_dim
+        self.require_full_coverage = require_full_coverage
         self.register_buffer('indices', self._init_connections())
 
     def _init_connections(self):
@@ -119,7 +121,7 @@ class FixedDenseConnections(Connections):
             f"Cannot have num_candidates * lut_rank > in_dim "
             f"({self.lut_rank} > {self.in_dim})"
         )
-        assert self.out_dim * self.lut_rank >= self.in_dim, (
+        assert not self.require_full_coverage or self.out_dim * self.lut_rank >= self.in_dim, (
                 f"Need out_dim * lut_rank >= in_dim to cover all inputs "
                 f"({self.out_dim} * {self.lut_rank} < {self.in_dim})."
                 )
@@ -315,7 +317,7 @@ class FixedConvConnections(Connections):
             conv_dimension: int = 2,
             lut_rank=2, 
             device=None,
-            init_method="random",  # | "random-unique"
+            init_method="random",  # | "random-unique" | "channel-balanced"
             channel_group_size: int = None,
             **kwargs
         ):
@@ -345,7 +347,7 @@ class FixedConvConnections(Connections):
         self.stride = stride
         self.padding = padding
         self.channel_group_size = channel_group_size
-        if channel_group_size is not None:
+        if channel_group_size is not None and init_method != "channel-balanced":
             assert channels > channel_group_size, (
                 "channel_group_size must be smaller than the number of channels"
             )
@@ -367,6 +369,8 @@ class FixedConvConnections(Connections):
             kernels = self._get_random_receptive_field_tensor()
         elif self.init_method == "random-unique":
             kernels = self._get_random_unique_receptive_field_tensor()
+        elif self.init_method == "channel-balanced":
+            kernels = self._get_channel_balanced_receptive_field_tensor()
         else:
             raise ValueError(f"Unknown connections type: {self.init_method}")
         # Build tree indices
@@ -477,6 +481,53 @@ class FixedConvConnections(Connections):
         coords = coords.permute(2, 0, 1, 3)
 
         return coords
+
+    def _get_channel_balanced_receptive_field_tensor(self):
+        """Sample spatially local leaves while balancing all input channels.
+
+        A shuffled cycle over the complete channel set is consumed across
+        kernels. Consequently global channel counts differ by at most one and
+        every kernel uses distinct channels whenever the number of channels is
+        at least the number of leaves in its logic tree. ``channel_group_size``
+        is intentionally ignored by this opt-in mode.
+        """
+
+        device = self.device
+        sample_size = self.lut_rank ** (self.tree_depth - 1)
+        leaves_per_kernel = self.lut_rank * sample_size
+        total_leaves = self.num_kernels * leaves_per_kernel
+
+        rf_axes = [
+            torch.arange(0, dim, device=device)
+            for dim in self.receptive_field_size
+        ]
+        spatial_grid = torch.meshgrid(*rf_axes, indexing="ij")
+        spatial_positions = torch.stack(
+            [grid.flatten() for grid in spatial_grid], dim=1
+        )
+
+        channel_cycle = torch.randperm(self.channels, device=device)
+        repetitions = (total_leaves + self.channels - 1) // self.channels
+        selected_channels = channel_cycle.repeat(repetitions)[:total_leaves]
+
+        spatial_indices = torch.randint(
+            spatial_positions.shape[0],
+            (total_leaves,),
+            device=device,
+        )
+        selected_spatial = spatial_positions[spatial_indices]
+        flat_coords = torch.cat(
+            (selected_spatial, selected_channels.unsqueeze(1)),
+            dim=1,
+        )
+
+        coords = flat_coords.view(
+            self.num_kernels,
+            sample_size,
+            self.lut_rank,
+            len(self.receptive_field_size) + 1,
+        )
+        return coords.permute(2, 0, 1, 3).contiguous()
     
     
     def _get_random_unique_receptive_field_tensor(self):

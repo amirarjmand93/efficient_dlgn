@@ -1,4 +1,4 @@
--e ..
+-e .
 torchvision
 tqdm>=4.0
 pandas>=2.0

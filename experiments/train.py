@@ -24,7 +24,7 @@ def get_parser():
     parser = argparse.ArgumentParser(description="Train TorchLogix models")
     # Dataset and architecture
     parser.add_argument(
-        "--dataset", type=str, choices=["mnist", "cifar-10"],
+        "--dataset", type=str, choices=["mnist", "cifar-10", "cifar-100"],
         default="mnist", help="Dataset to train on"
     )
     parser.add_argument(

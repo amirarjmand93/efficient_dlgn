@@ -98,3 +98,35 @@ def test_fixed_conv_connections(channel_group_size):
             assert len(considered_channels) <= channel_group_size, (
                 "channel_group_size must be smaller than the number of channels"
             )
+
+
+@pytest.mark.parametrize("channels", [3, 12, 24])
+def test_channel_balanced_conv_connections(channels):
+    num_kernels = 36
+    tree_depth = 3
+    leaves_per_kernel = 2**tree_depth
+    conn = FixedConvConnections(
+        in_dim=32,
+        channels=channels,
+        num_kernels=num_kernels,
+        tree_depth=tree_depth,
+        receptive_field_size=3,
+        channel_group_size=1,
+        init_method="channel-balanced",
+    )
+
+    first_position = conn.indices[0][:, :, 0, :, :]
+    channel_indices = first_position[..., -1].permute(1, 0, 2)
+    channel_indices = channel_indices.reshape(num_kernels, leaves_per_kernel)
+
+    expected_unique = min(channels, leaves_per_kernel)
+    assert all(
+        kernel_channels.unique().numel() == expected_unique
+        for kernel_channels in channel_indices
+    )
+    usage = torch.bincount(channel_indices.flatten(), minlength=channels)
+    assert int(usage.max() - usage.min()) <= 1
+
+    spatial_indices = first_position[..., :-1]
+    assert torch.all(spatial_indices >= 0)
+    assert torch.all(spatial_indices < 3)

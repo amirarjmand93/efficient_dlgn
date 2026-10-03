@@ -1,6 +1,11 @@
 import torch
 import torch.nn as nn
-from ..layers import OrPooling2d, GroupSum, LogicConv2d, LogicDense
+from ..layers import (
+    OrPooling2d,
+    GroupSum,
+    LogicConv2d,
+    LogicDense,
+)
 from ..layers.binarization import setup_binarization
 
 
@@ -167,6 +172,7 @@ class ClgnCifar10(torch.nn.Sequential):
     tau = None
     group_size = None
     group_size_input = None
+    extra_conv_layers = 0
 
     def __init__(self, thresholds: torch.Tensor, binarization: str, binarization_kwargs: dict, connections_kwargs: dict, **llkw):
         assert thresholds.shape[-1] == self.n_input_bits, f"{self.__class__.__name__} model requires {self.n_input_bits}-bit thresholds."
@@ -224,7 +230,7 @@ class ClgnCifar10(torch.nn.Sequential):
             )
         )
         layers.append(OrPooling2d(kernel_size=2, stride=2)) # 16kx4x4
-        
+    
         layers.append(
             LogicConv2d(
                 in_dim=4,
@@ -237,6 +243,19 @@ class ClgnCifar10(torch.nn.Sequential):
                 **llkw,
             )
         )
+        for _ in range(self.extra_conv_layers):
+            layers.append(
+                LogicConv2d(
+                    in_dim=4,
+                    channels=32*self.k_num,
+                    num_kernels=32*self.k_num,
+                    tree_depth=3,
+                    receptive_field_size=3,
+                    padding=1,
+                    connections_kwargs=connections_kwargs,
+                    **llkw,
+                )
+            )
         layers.append(OrPooling2d(kernel_size=2, stride=2)) # 32kx2x2
 
         layers.append(torch.nn.Flatten()) # 128k
@@ -244,6 +263,7 @@ class ClgnCifar10(torch.nn.Sequential):
         layers.append(LogicDense(in_dim=128*self.k_num, out_dim=1280*self.k_num, **llkw))
         layers.append(LogicDense(in_dim=1280*self.k_num, out_dim=640*self.k_num, **llkw))
         layers.append(LogicDense(in_dim=640*self.k_num, out_dim=320*self.k_num, **llkw))
+        #layers.append(LogicDense(in_dim=320*self.k_num, out_dim=320*self.k_num, **llkw))
 
         super(ClgnCifar10, self).__init__(*layers, GroupSum(k=10, tau=self.tau))
 
@@ -276,6 +296,12 @@ class ClgnCifar10Small2(ClgnCifar10):
     tau = 20
     group_size = 2
     group_size_input = 1
+
+
+class ClgnCifar10_deepconv(ClgnCifar10Small):
+    """CLGN-small with one extra 4x4 convolution before the final pool."""
+
+    extra_conv_layers = 1
 
 
 class ClgnCifar10Medium2(ClgnCifar10):

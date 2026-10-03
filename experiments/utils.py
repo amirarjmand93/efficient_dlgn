@@ -32,6 +32,13 @@ def load_dataset(args):
         test_set = torchvision.datasets.CIFAR10(
             f"{data_path}/data-cifar", train=False, transform=transform
         )
+    elif args.dataset == "cifar-100":
+        train_set = torchvision.datasets.CIFAR100(
+            f"{data_path}/data-cifar", train=True, download=True, transform=transform
+        )
+        test_set = torchvision.datasets.CIFAR100(
+            f"{data_path}/data-cifar", train=False, transform=transform
+        )
     
     if args.valid_set_size > 0:
         train_set_size = math.ceil((1 - args.valid_set_size) * len(train_set))

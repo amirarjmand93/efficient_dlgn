@@ -2,6 +2,8 @@ venv/
 *.png
 *.svg
 *.ps1
+*.csv
+*.pt
 *pyc
 .idea
 *.so
@@ -12,6 +14,12 @@ __pycache__/
 *.pytest_cache/
 build/
 experiments/results/
+data/
+examples/data/
+examples/phase_logic/results/
+torchlogix-project.tar.gz
+__pycache__/
+*.pyc
 
 # Documentation build artifacts
 docs/_build/
@@ -30,3 +38,4 @@ experiments/data
 
 # env files with concrete paths
 experiments/env.sh
+logc_env
