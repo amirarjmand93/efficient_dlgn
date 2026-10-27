@@ -1,7 +1,10 @@
-"""Class-aligned fixed connectivity for rank-2 LogicDense layers."""
+"""Class-aligned connectivity for rank-2 LogicDense layers."""
+
+import math
 
 import torch
 
+from ..parametrization import LightLUTParametrization
 from .dense import LogicDense
 
 
@@ -148,3 +151,91 @@ class ClassRoutedLogicDense(LogicDense):
             seed=self.topology_seed,
             device=self.device,
         )
+
+    @torch.no_grad()
+    def row_entropy(self) -> torch.Tensor:
+        """Mean normalized LightLUT truth-table entropy for each output row."""
+        if not isinstance(self.parametrization, LightLUTParametrization):
+            raise ValueError("Entropy monitoring requires LightLUT parametrization.")
+        probabilities = torch.sigmoid(
+            self.weight.detach() / self.parametrization.temperature
+        ).clamp(1e-7, 1 - 1e-7)
+        entropy = -probabilities * probabilities.log()
+        entropy -= (1 - probabilities) * torch.log1p(-probabilities)
+        return entropy.mean(dim=1) / math.log(2)
+
+    @torch.no_grad()
+    def candidate_pairs(
+        self,
+        inputs: torch.Tensor,
+        output_gradient: torch.Tensor,
+        row: int,
+        *,
+        feature_pool_size: int,
+        num_candidates: int,
+    ) -> torch.Tensor:
+        """Screen all shared features, then pair high-signal diverse features.
+
+        The score is the minibatch covariance of one input feature with the
+        selected gate's output gradient. Only this gate's score vector is
+        formed, never an in_dim-by-out_dim routing matrix.
+        """
+        if not self.shared_input:
+            raise ValueError("Candidate search requires shared-input routing.")
+        if inputs.ndim != 2 or inputs.shape[1] != self.in_dim:
+            raise ValueError("inputs must have shape (batch, in_dim).")
+        if output_gradient.shape != (inputs.shape[0],):
+            raise ValueError("output_gradient must have shape (batch,).")
+        centered_gradient = output_gradient - output_gradient.mean()
+        scores = torch.mv(inputs.T, centered_gradient).abs()
+        pool = scores.topk(min(self.in_dim, feature_pool_size)).indices
+        count = min(num_candidates, pool.numel() - 1)
+        centered = inputs[:, pool] - inputs[:, pool].mean(dim=0, keepdim=True)
+        norms = torch.linalg.vector_norm(centered, dim=0).clamp_min(1e-8)
+        correlations = (
+            centered[:, :count].T @ centered
+        ).abs() / (norms[:count, None] * norms[None, :])
+        partner_scores = scores[pool][None, :] * (1 - correlations)
+        partner_scores.scatter_(
+            1, torch.arange(count, device=pool.device)[:, None], float("-inf")
+        )
+        current = self.connections.indices[:, row]
+        partner_scores.masked_fill_(
+            ((pool[:count, None] == current[0]) & (pool[None, :] == current[1]))
+            | ((pool[:count, None] == current[1]) & (pool[None, :] == current[0])),
+            float("-inf"),
+        )
+        partner = partner_scores.argmax(dim=1)
+        pairs = torch.stack((pool[:count], pool[partner]), dim=1)
+        valid = torch.isfinite(partner_scores.gather(1, partner[:, None])[:, 0])
+        return pairs[valid]
+
+    @torch.no_grad()
+    def replace_row(
+        self,
+        row: int,
+        pair: torch.Tensor,
+        new_weight: torch.Tensor,
+        optimizer: torch.optim.Optimizer,
+    ) -> None:
+        """Install a probed pair and reset only that gate's weights/moments."""
+        if not self.shared_input:
+            raise ValueError("Rewiring requires shared-input routing.")
+        if not 0 <= row < self.out_dim:
+            raise IndexError(row)
+        if (
+            pair.shape != (2,)
+            or bool((pair < 0).any())
+            or bool((pair >= self.in_dim).any())
+            or bool(pair[0] == pair[1])
+        ):
+            raise ValueError("pair must contain two distinct, valid input indices.")
+        if new_weight.shape != self.weight[row].shape:
+            raise ValueError("new_weight shape does not match the LUT row.")
+        self.connections.indices[:, row].copy_(pair)
+        self.weight[row].copy_(new_weight)
+        state = optimizer.state.get(self.weight, {})
+        for name in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+            moment = state.get(name)
+            if moment is not None:
+                moment[row].zero_()

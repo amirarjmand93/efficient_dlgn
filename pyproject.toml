@@ -35,6 +35,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+plots = [
+    "matplotlib>=3.7",
+]
+compact = [
+    "compactlogic @ git+https://github.com/eth-sri/CompactLogic.git@019677a79a1a3039e3c2c7f26689f3bcec8e22f9",
+]
 dev = [
     "flake8>=6.1.0",
     "black>=23.12.1",

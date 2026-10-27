@@ -1885,7 +1885,7 @@ void circuit_bench(
                         sv_lines.append(f"        s_{j} = 0;\n        {slot} = {val};")
                     else:
                         sv_lines.append(
-                            f"        s_{j} = 0;\n"
+                            f"        s_{j} = {int(round(sr.beta))};\n"
                             f"        for (i = {start}; i < {end}; i = i + 1)"
                             f" s_{j} = s_{j} + raw[i];\n"
                             f"        {slot} = s_{j};"

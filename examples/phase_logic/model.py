@@ -20,6 +20,17 @@ from torchlogix.models.conv import (
 )
 
 from .wire_erasing import BooleanWireErasure
+from .compact import CandidateLogicLayer, UniformThermometerEncoder
+from .classrouted_compact import (
+    ClassRoutedCandidateDense,
+    build_model_cifar10_small_classrouted_compact_head,
+    build_model_cifar10_compact_sixconv,
+)
+from .mrlb_compact import build_model_cifar10_small_mrlb_compact_head
+from .shared_compact import (
+    build_model_cifar10_small_compact_head,
+    build_model_cifar10_small_compact_head_wide75,
+)
 
         
 class StraightThroughBinarize(torch.autograd.Function):
@@ -52,6 +63,10 @@ class HybridFeatureEncoder(torch.nn.Module):
 
     hybrid:
         Quantile bits followed by sinusoidal bits for each RGB channel.
+
+    hybrid_lbp:
+        Q2 followed by two center-symmetric local comparison bitplanes per
+        RGB channel (horizontal, vertical). Selected by --hybrid-features lbp.
 
     Hybrid output ordering
     ----------------------
@@ -93,7 +108,7 @@ class HybridFeatureEncoder(torch.nn.Module):
     cycle as the pixel value moves from 0 to 1.
     """
 
-    MODES = ("fixed", "quantile", "sinusoidal", "hybrid")
+    MODES = ("fixed", "quantile", "sinusoidal", "hybrid", "hybrid_lbp")
 
     def __init__(
         self,
@@ -129,7 +144,10 @@ class HybridFeatureEncoder(torch.nn.Module):
                 f"got {min_sine_frequency}."
             )
 
-        uses_quantiles = mode in {"fixed", "quantile", "hybrid"}
+        if mode == "hybrid_lbp" and num_quantile_bits != 2:
+            raise ValueError("Q2+LBP encoding requires exactly 2 quantile bits.")
+
+        uses_quantiles = mode in {"fixed", "quantile", "hybrid", "hybrid_lbp"}
         uses_sine = mode in {"sinusoidal", "hybrid"}
 
         self.mode = mode
@@ -342,6 +360,10 @@ class HybridFeatureEncoder(torch.nn.Module):
         return self._num_sine_bits
 
     @property
+    def num_lbp_bits(self) -> int:
+        return 2 if self.mode == "hybrid_lbp" else 0
+
+    @property
     def num_bits(self) -> int:
         """
         Number of encoded bits PER RGB channel.
@@ -349,6 +371,7 @@ class HybridFeatureEncoder(torch.nn.Module):
         return (
             self.num_quantile_bits
             + self.num_sine_bits
+            + self.num_lbp_bits
         )
 
     @property
@@ -360,6 +383,8 @@ class HybridFeatureEncoder(torch.nn.Module):
 
     @property
     def channel_order(self) -> str:
+        if self.num_lbp_bits:
+            return "per RGB channel: quantile bits, then LBP horizontal, vertical"
         if self.mode == "hybrid":
             return (
                 "per RGB channel: quantile bits, then sine bits"
@@ -411,6 +436,17 @@ class HybridFeatureEncoder(torch.nn.Module):
         return (
             expanded >= thresholds
         ).to(dtype)
+
+    def _encode_lbp(self, x: torch.Tensor) -> torch.Tensor:
+        """Two fixed radius-1 comparisons, not a full 8-neighbor LBP code.
+
+        Replicate padding preserves image size without wrapping opposite edges.
+        Output shape is [B,3,2,H,W], horizontal before vertical; ties map to 1.
+        """
+        padded = torch.nn.functional.pad(x, (1, 1, 1, 1), mode="replicate")
+        horizontal = padded[:, :, 1:-1, 2:] >= padded[:, :, 1:-1, :-2]
+        vertical = padded[:, :, 2:, 1:-1] >= padded[:, :, :-2, 1:-1]
+        return torch.stack((horizontal, vertical), dim=2).to(x.dtype)
 
     def _encode_sine(
         self,
@@ -517,6 +553,9 @@ class HybridFeatureEncoder(torch.nn.Module):
             feature_groups.append(
                 sine_bits
             )
+
+        if self.num_lbp_bits:
+            feature_groups.append(self._encode_lbp(x))
 
         if not feature_groups:
             raise RuntimeError(
@@ -644,6 +683,12 @@ class HybridFeatureEncoder(torch.nn.Module):
 
                 bit_index += 1
 
+            for direction in ("horizontal", "vertical") if self.num_lbp_bits else ():
+                report[f"{rgb_name}_lbp_{direction}"] = rates[
+                    rgb_index, bit_index,
+                ].item()
+                bit_index += 1
+
         return report
 
     # ================================================================
@@ -655,6 +700,7 @@ class HybridFeatureEncoder(torch.nn.Module):
             f"mode={self.mode!r}, "
             f"quantile_bits={self.num_quantile_bits}, "
             f"sine_bits={self.num_sine_bits}, "
+            f"{'lbp_bits=2, ' if self.num_lbp_bits else ''}"
             f"output_channels={self.output_channels}, "
             f"sigma={self.sigma:g}, "
             f"min_sine_frequency={self.min_sine_frequency:g}, "
@@ -697,6 +743,8 @@ def _build_cifar10_encoder(
 
     if input_encoding is None:
         input_encoding = "fixed" if input_thresholds is None else "quantile"
+    if input_encoding == "thermometer":
+        return UniformThermometerEncoder(num_quantile_bits)
     if input_encoding == "fixed":
         if input_thresholds is None:
             input_thresholds = torch.full((3, 1), 0.5, dtype=torch.float32)
@@ -705,7 +753,7 @@ def _build_cifar10_encoder(
         if input_thresholds is None:
             raise ValueError("Quantile encoding requires training-set thresholds.")
         return QuantileThermometerEncoder(input_thresholds)
-    if input_encoding not in {"sinusoidal", "hybrid"}:
+    if input_encoding not in {"sinusoidal", "hybrid", "hybrid_lbp"}:
         raise ValueError(f"Unsupported CIFAR input encoding {input_encoding!r}.")
     return HybridFeatureEncoder(
         mode=input_encoding,
@@ -1383,6 +1431,44 @@ def build_model_cifar10_linear_head(
         torch.nn.Linear(width, 10),
     ).to(device)
 
+####best model for cifar10
+def build_model_cifar10_compact_small(
+    device: torch.device,
+    *,
+    parametrization: str = "compact",
+    input_thresholds: torch.Tensor | None = None,
+    input_encoding: str = "thermometer",
+    num_quantile_bits: int = 3,
+    num_sine_bits: int = 0,
+    sine_sigma: float = 1.0,
+    sine_seed: int = 0,
+    compact_backend: str = "auto",
+) -> torch.nn.Module:
+    """CompactLogic-S: four single-gate convolutions, two candidate dense layers."""
+
+    if parametrization != "compact":
+        raise ValueError("CompactLogic requires parametrization='compact' (16 candidate triples).")
+    encoder = _build_cifar10_encoder(
+        input_thresholds, input_encoding=input_encoding,
+        num_quantile_bits=num_quantile_bits, num_sine_bits=num_sine_bits,
+        sine_sigma=sine_sigma, sine_seed=sine_seed,
+    )
+    shape = (encoder.output_channels, 32, 32)
+    layers = [encoder]
+    for channels, stride in ((128, 2), (128, 1), (512, 2), (512, 1)):
+        layers.append(CandidateLogicLayer(
+            device=device, backend=compact_backend, in_dim=math.prod(shape),
+            out_dim=channels, in_shape=shape, stride=stride,
+        ))
+        shape = (channels, (shape[1] + stride - 1) // stride,
+                 (shape[2] + stride - 1) // stride)
+    layers.append(torch.nn.Flatten())
+    for in_dim in (math.prod(shape), 80_000):
+        layers.append(CandidateLogicLayer(
+            device=device, backend=compact_backend, in_dim=in_dim, out_dim=80_000,
+        ))
+    return torch.nn.Sequential(*layers, GroupSum(k=10, tau=40)).to(device)
+
 
 MODEL_BUILDERS = {
     "build_model": ("mnist", build_model),
@@ -1393,6 +1479,8 @@ MODEL_BUILDERS = {
         "cifar10",
         build_model_cifar10_smallmodel,
     ),
+    "build_model_cifar10_compact_small": ("cifar10", build_model_cifar10_compact_small),
+    "build_model_cifar10_compact_sixconv": ("cifar10", build_model_cifar10_compact_sixconv),
     "build_model_cifar10_small_modifieddense": (
         "cifar10",
         build_model_cifar10_small_modifieddense,
@@ -1400,6 +1488,18 @@ MODEL_BUILDERS = {
     "build_model_cifar10_small_classrouted": (
         "cifar10",
         build_model_cifar10_small_classrouted,
+    ),
+    "build_model_cifar10_small_classrouted_compact_head": (
+        "cifar10", build_model_cifar10_small_classrouted_compact_head,
+    ),
+    "build_model_cifar10_small_mrlb_compact_head": (
+        "cifar10", build_model_cifar10_small_mrlb_compact_head,
+    ),
+    "build_model_cifar10_small_compact_head": (
+        "cifar10", build_model_cifar10_small_compact_head,
+    ),
+    "build_model_cifar10_small_compact_head_wide75": (
+        "cifar10", build_model_cifar10_small_compact_head_wide75,
     ),
     "build_model_cifar10_small_classrouted_channelmixed": (
         "cifar10",
@@ -1436,8 +1536,22 @@ def build_model_for_dataset(
     num_sine_bits: int = 2,
     sine_sigma: float = 1.0,
     sine_seed: int = 0,
+    compact_backend: str = "auto",
+    hybrid_features: str = "sine",
+    mrlb_conv3_relational_channels: int = 128,
 ) -> torch.nn.Module:
     """Build the requested dataset and classification-head combination."""
+
+    if hybrid_features not in {"sine", "lbp"}:
+        raise ValueError("hybrid_features must be 'sine' or 'lbp'.")
+    if hybrid_features == "lbp":
+        if dataset not in {"cifar10", "cifar100"} or input_encoding != "hybrid":
+            raise ValueError("LBP features require CIFAR with input_encoding='hybrid'.")
+        if num_quantile_bits != 2:
+            raise ValueError("Q2+LBP encoding requires exactly 2 quantile bits.")
+        # All CIFAR builders already use the common encoder factory. Resolve
+        # the opt-in here without changing their signatures or model topology.
+        input_encoding = "hybrid_lbp"
 
     try:
         builder_dataset, builder = MODEL_BUILDERS[model_variant]
@@ -1463,6 +1577,17 @@ def build_model_for_dataset(
                 "sine_seed": sine_seed,
             }
         )
+    if model_variant in {
+        "build_model_cifar10_compact_small",
+        "build_model_cifar10_small_compact_head",
+        "build_model_cifar10_small_compact_head_wide75",
+        "build_model_cifar10_small_classrouted_compact_head",
+        "build_model_cifar10_compact_sixconv",
+        "build_model_cifar10_small_mrlb_compact_head",
+    }:
+        builder_kwargs["compact_backend"] = compact_backend
+    if model_variant == "build_model_cifar10_small_mrlb_compact_head":
+        builder_kwargs["mrlb_conv3_relational_channels"] = mrlb_conv3_relational_channels
     return builder(device, **builder_kwargs)
 
 
@@ -1472,8 +1597,31 @@ def logic_layer_width_report(
     """Describe output-wire and LUT-node widths for every logic layer."""
 
     report = []
+    routed_prefixes = []
     for name, module in model.named_modules():
-        if isinstance(module, LogicConv2d):
+        if any(name.startswith(prefix) for prefix in routed_prefixes):
+            continue
+        if isinstance(module, ClassRoutedCandidateDense):
+            routed_prefixes.append(name + ".")
+            report.append({
+                "layer": name, "type": type(module).__name__,
+                "width": module.out_dim, "output_wires": module.out_dim,
+                "shared_lut_nodes": module.out_dim, "lut_node_applications": module.out_dim,
+                "training_candidates_per_node": 16,
+            })
+        elif isinstance(module, CandidateLogicLayer):
+            positions = 1
+            if module.is_convolution:
+                positions = math.prod((dim + module.stride - 1) // module.stride
+                                      for dim in module.in_shape[1:])
+            wires = module.out_dim * positions
+            report.append({
+                "layer": name, "type": "CompactConv" if module.is_convolution else "CompactDense",
+                "width": wires, "output_wires": wires,
+                "shared_lut_nodes": module.out_dim, "lut_node_applications": wires,
+                "training_candidates_per_node": module.num_gates,
+            })
+        elif isinstance(module, LogicConv2d):
             luts_per_output = sum(
                 module.lut_rank**level
                 for level in range(module.tree_depth)

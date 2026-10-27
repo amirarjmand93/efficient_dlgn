@@ -45,16 +45,23 @@ def _build_cifar10(
     if augment:
         if not train:
             raise ValueError("CIFAR test data must not be augmented.")
-        transform_steps.extend(
-            [
-                transforms.RandomCrop(
-                    32,
-                    padding=4,
-                    padding_mode="reflect",
-                ),
+        if config.uses_compact_logic:
+            transform_steps = [
                 transforms.RandomHorizontalFlip(),
+                transforms.RandomCrop(32, padding=2, padding_mode="edge"),
+                transforms.ToTensor(),
             ]
-        )
+        else:
+            transform_steps.extend(
+                [
+                    transforms.RandomCrop(
+                        32,
+                        padding=4,
+                        padding_mode="reflect",
+                    ),
+                    transforms.RandomHorizontalFlip(),
+                ]
+            )
         if config.cifar_random_erasing:
             transform_steps.append(
                 transforms.RandomErasing(
@@ -159,6 +166,9 @@ def build_cifar10_input_thresholds(
         return None
     if config.input_encoding == "fixed":
         return torch.full((3, 1), 0.5, dtype=torch.float32)
+    if config.input_encoding == "thermometer":
+        thresholds = torch.arange(1, config.num_input_bits + 1, dtype=torch.float32)
+        return (thresholds / (config.num_input_bits + 1)).expand(3, -1).clone()
     if config.input_encoding == "sinusoidal":
         return None
     return compute_cifar10_quantile_thresholds(
@@ -211,6 +221,7 @@ def build_data_loaders(
         generator=train_generator,
         num_workers=config.num_workers,
         pin_memory=pin_memory,
+        drop_last=config.uses_compact_logic,
     )
     train_eval_loader = DataLoader(
         train_eval_set,

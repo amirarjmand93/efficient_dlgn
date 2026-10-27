@@ -39,3 +39,14 @@ experiments/data
 # env files with concrete paths
 experiments/env.sh
 logc_env
+
+# Local FPGA tools and generated post-training artifacts
+/downloads/
+/examples/phase_logic/post_training/outputs/
+/examples/phase_logic/post_training/modified_verilog_pr/generated/
+**/__pycache__/
+.Xil/
+/0.002
+/Conv3
+/Dense1
+/source
