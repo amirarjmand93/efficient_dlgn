@@ -28,6 +28,11 @@ from .classrouted_compact import (
 )
 from .mrlb_compact import build_model_cifar10_small_mrlb_compact_head
 from .shared_compact import (
+    build_model_cifar100_small_compact,
+    build_model_mnist_small_compact,
+    build_model_heartbeat_small_compact,
+    build_model_cifar10_small_compact,
+    build_model_cifar10_small_compact_88000,
     build_model_cifar10_small_compact_head,
     build_model_cifar10_small_compact_head_wide75,
 )
@@ -1495,6 +1500,21 @@ MODEL_BUILDERS = {
     "build_model_cifar10_small_mrlb_compact_head": (
         "cifar10", build_model_cifar10_small_mrlb_compact_head,
     ),
+    "build_model_cifar10_small_compact": (
+        "cifar10", build_model_cifar10_small_compact,
+    ),
+    "build_model_cifar100_small_compact": (
+        "cifar100", build_model_cifar100_small_compact,
+    ),
+    "build_model_mnist_small_compact": (
+        "mnist", build_model_mnist_small_compact,
+    ),
+    "build_model_heartbeat_small_compact": (
+        "heartbeat", build_model_heartbeat_small_compact,
+    ),
+    "build_model_cifar10_small_compact_88000": (
+        "cifar10", build_model_cifar10_small_compact_88000,
+    ),
     "build_model_cifar10_small_compact_head": (
         "cifar10", build_model_cifar10_small_compact_head,
     ),
@@ -1545,13 +1565,13 @@ def build_model_for_dataset(
     if hybrid_features not in {"sine", "lbp"}:
         raise ValueError("hybrid_features must be 'sine' or 'lbp'.")
     if hybrid_features == "lbp":
-        if dataset not in {"cifar10", "cifar100"} or input_encoding != "hybrid":
-            raise ValueError("LBP features require CIFAR with input_encoding='hybrid'.")
+        if dataset not in {"cifar10", "cifar100", "heartbeat"} or input_encoding != "hybrid":
+            raise ValueError("Local comparison features require CIFAR or heartbeat with input_encoding='hybrid'.")
         if num_quantile_bits != 2:
             raise ValueError("Q2+LBP encoding requires exactly 2 quantile bits.")
-        # All CIFAR builders already use the common encoder factory. Resolve
-        # the opt-in here without changing their signatures or model topology.
-        input_encoding = "hybrid_lbp"
+        if dataset in {"cifar10", "cifar100"}:
+            # CIFAR builders use the existing encoder factory unchanged.
+            input_encoding = "hybrid_lbp"
 
     try:
         builder_dataset, builder = MODEL_BUILDERS[model_variant]
@@ -1566,19 +1586,24 @@ def build_model_for_dataset(
             f"not {dataset}."
         )
     builder_kwargs = {"parametrization": parametrization}
-    if dataset in {"cifar10", "cifar100"}:
+    if dataset in {"cifar10", "cifar100", "heartbeat"}:
         builder_kwargs.update(
             {
                 "input_thresholds": input_thresholds,
                 "input_encoding": input_encoding,
                 "num_quantile_bits": num_quantile_bits,
                 "num_sine_bits": num_sine_bits,
-                "sine_sigma": sine_sigma,
-                "sine_seed": sine_seed,
             }
         )
+        if dataset != "heartbeat":
+            builder_kwargs.update(sine_sigma=sine_sigma, sine_seed=sine_seed)
     if model_variant in {
+        "build_model_mnist_small_compact",
+        "build_model_heartbeat_small_compact",
+        "build_model_cifar100_small_compact",
         "build_model_cifar10_compact_small",
+        "build_model_cifar10_small_compact",
+        "build_model_cifar10_small_compact_88000",
         "build_model_cifar10_small_compact_head",
         "build_model_cifar10_small_compact_head_wide75",
         "build_model_cifar10_small_classrouted_compact_head",

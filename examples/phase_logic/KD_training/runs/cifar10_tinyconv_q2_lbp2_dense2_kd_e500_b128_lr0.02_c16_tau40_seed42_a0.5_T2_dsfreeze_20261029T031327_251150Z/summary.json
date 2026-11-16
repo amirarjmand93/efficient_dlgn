@@ -1,0 +1,51 @@
+{
+  "best_epoch": 360,
+  "validation_discrete": {
+    "loss": 1.1156508840560913,
+    "accuracy": 0.619
+  },
+  "test_evaluated": false,
+  "staged_freezing": {
+    "best_checkpoint": {
+      "mode": "mapping_discrete_stability_v2",
+      "frozen_mappings": [
+        "conv1_mapping",
+        "conv2_mapping",
+        "dense1_mapping"
+      ],
+      "current_target": "dense2_mapping",
+      "monitoring": false,
+      "stable_count": 0,
+      "observe_count": 45,
+      "stability_patience": 10,
+      "max_mapping_change": 0.001,
+      "small_layer_minimum_allowed_changes": 1,
+      "monitor_epochs": 5,
+      "max_accuracy_drop": 0.015,
+      "max_loss_increase": 0.05,
+      "retry_cooldown": 10,
+      "max_observe_epochs": 100
+    },
+    "training_end": {
+      "mode": "mapping_discrete_stability_v2",
+      "frozen_mappings": [
+        "conv1_mapping",
+        "conv2_mapping",
+        "dense1_mapping",
+        "dense2_mapping"
+      ],
+      "current_target": null,
+      "monitoring": false,
+      "stable_count": 0,
+      "observe_count": 0,
+      "stability_patience": 10,
+      "max_mapping_change": 0.001,
+      "small_layer_minimum_allowed_changes": 1,
+      "monitor_epochs": 5,
+      "max_accuracy_drop": 0.015,
+      "max_loss_increase": 0.05,
+      "retry_cooldown": 10,
+      "max_observe_epochs": 100
+    }
+  }
+}

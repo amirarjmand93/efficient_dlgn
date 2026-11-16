@@ -1,0 +1,87 @@
+{
+  "input_shape": [
+    2,
+    4,
+    4
+  ],
+  "input_bits": 32,
+  "layer_names": [
+    "conv1",
+    "dense1",
+    "dense2"
+  ],
+  "layer_shapes": [
+    [
+      3,
+      3,
+      3
+    ],
+    [
+      8
+    ],
+    [
+      10
+    ]
+  ],
+  "stage_instruction_counts": [
+    27,
+    8,
+    10
+  ],
+  "n_classes": 2,
+  "class_ranges": [
+    [
+      0,
+      5,
+      0
+    ],
+    [
+      5,
+      10,
+      1
+    ]
+  ],
+  "score_width_bits": 16,
+  "address_width_bits": 6,
+  "bank_depths": [
+    32,
+    27
+  ],
+  "encoding": "full",
+  "program_width_bits": 100,
+  "program_instructions": 45,
+  "rom_bits_theoretical": 4500,
+  "truth_entries": 0,
+  "truth_id_bits": 1,
+  "padding_pins": 0,
+  "inference_core_cycles": 945,
+  "clock_period_ns_target": 10.0,
+  "reference_outputs": [
+    [
+      4,
+      2
+    ],
+    [
+      3,
+      2
+    ],
+    [
+      1,
+      2
+    ],
+    [
+      3,
+      3
+    ],
+    [
+      2,
+      2
+    ]
+  ],
+  "microprogram_sha256": "244dec1256b3e42fb6811e201cdb20a8be3b7dcffa1d3b73214560b9d04e385c",
+  "notes": [
+    "Raw RGB encoder is not included",
+    "Physical timing and routing require Vivado",
+    "Only linear LUT6Conv2D/LUT6Dense + BooleanGroupSum models supported"
+  ]
+}

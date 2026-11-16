@@ -1,0 +1,237 @@
+# DLGN LUT6 JSON → sequential SystemVerilog bridge
+
+**Reusable, dependency-free Python 3.9+ code generator** for a defined subset of
+`hls4ml_lut6_ir_v1`. Designed to copy into your `torchlogix` repository.
+
+This package converts the trained Boolean function in the JSON into a sequential,
+memory-based FPGA architecture. It does **not** train the model, perform RGB
+encoding, add a PS/ARM processor, synthesize a bitstream, or promise timing/routing
+for every device.
+
+## Install into your repository
+
+Copy the entire `lut6_json_sv_bridge/` directory somewhere inside `torchlogix`,
+for example:
+
+```text
+torchlogix/
+  examples/phase_logic/KD_training/post_training/...
+  tools/
+    lut6_json_sv_bridge/
+      lut6_json_bridge/compiler.py
+      rtl/lut6_engine.sv.in
+      tests/test_bridge.py
+      ...
+```
+
+There are **no pip dependencies**. Use Python 3.9+ (`py -3` on Windows).
+
+## Step 1 — Generate a hardware project
+
+From a terminal whose current directory is `tools/lut6_json_sv_bridge/`:
+
+```powershell
+py -3 -m lut6_json_bridge.compiler `
+    --ir "C:\path\to\your\model_ir.json" `
+    --out "C:\path\to\generated_my_model" `
+    --encoding full `
+    --random-tests 2 `
+    --clock-ns 10 `
+    --copy-ir
+```
+
+For a self-contained example included in this package:
+
+```powershell
+py -3 -m lut6_json_bridge.compiler --ir examples\reference_original_ir.json --out generated_original --encoding full
+```
+
+Linux equivalent:
+
+```bash
+python3 -m lut6_json_bridge.compiler --ir examples/reference_original_ir.json --out generated_original --encoding full
+```
+
+### ROM layouts
+
+- `--encoding full` (default): one word per logical LUT: `INIT[63:0]` plus 6 source addresses. With the supplied original 6-channel model, this produces the **exact same 148-bit microprogram bytes** as the earlier proven sequential design, SHA-256 `3f1d3da2b0c6c5005721a5c3d99aabad23fd9c76c60d49450910f0cb32bf3401`.
+- `--encoding split` (optional): microprogram stores 6 source addresses and a small truth-table ID. A second ROM stores all unique 64-bit INIT values. This can reduce raw ROM bits on some models, but **may not reduce physical BRAM count** due to packing and port constraints. Adds **one clock per LUT evaluation**. Must be independently synthesized and routed on the target device.
+
+Both methods preserve the original Boolean truth tables and logical outputs.
+
+## Step 2 — Files generated for each model
+
+```text
+generated_my_model/
+  manifest.json                 dimensions, ROM size, instruction/cycle counts, reference scores, SHA
+  rtl/lut6_sequential.sv       generated sequential RTL
+  rtl/lut6_program.mem         generated instruction ROM ($readmemh)
+  rtl/lut6_truth.mem           only for --encoding split
+  sim/tb_lut6_sequential.sv    self-checking XSim testbench
+  vectors/case_000.mem         all-zeros input, then ones, random, spatial, ...
+  vectors/golden.mem           exact packed reference output for each case
+  vectors/golden.json          scores in human-readable format
+  run_sim.ps1                  Windows simulator runner
+  run_sim.sh                   Linux simulator runner
+  run_impl.ps1                 Windows Vivado implementation runner
+  vivado/implement.tcl        new synth/place/route flow for a selected FPGA part
+  timing.xdc                   100-MHz clock by default (no board I/O constraints)
+```
+
+The generator independently evaluates the **original JSON layers** and the
+**decoded microprogram** for every generated test vector, comparing all class
+scores. This is a compilation correctness check, not RTL simulation.
+
+## Step 3 — Verify real RTL in Vivado 2022.2
+
+From the **generated project** directory in Windows PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run_sim.ps1
+```
+
+Successful XSim run prints:
+
+```text
+ALL_TESTS_PASS cases=6
+SIMULATION_PASS
+```
+
+By default it checks all-zero, all-one, pseudorandom seed-42, spatial, and two
+additional pseudorandom inputs. It also checks the cycle count, input-valid
+pauses, an early ignored `start`, a one-cycle `done`, and all class scores. The
+expected cycle count comes from the generated ROM's actual padding-read count.
+
+**The generated generic engine has not been run through Vivado in this artifact's
+build environment.** The original fixed-layout engine passed your previous XSim
+and Vivado routing tests; re-run simulation on this generated version before
+regarding it as hardware-verified.
+
+## Step 4 — Run synthesis, placement and routing
+
+From the **generated project** directory:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run_impl.ps1 -Part xczu3cg-sfvc784-1-e -Tag zu3cg
+```
+
+Equivalent direct Vivado call:
+
+```powershell
+& "C:\Xilinx\Vivado\2022.2\bin\vivado.bat" -mode batch -source vivado/implement.tcl -tclargs xczu3cg-sfvc784-1-e zu3cg
+```
+
+Or Zynq-7020 (memory may be too small):
+
+```powershell
+& "C:\Xilinx\Vivado\2022.2\bin\vivado.bat" -mode batch -source vivado/implement.tcl -tclargs xc7z020clg484-1 z7020
+```
+
+Outputs are separated by tag in `vivado_build_zu3cg/` and `reports_zu3cg/`,
+so the project does not overwrite your previously routed ZU7EV/ZU3CG builds.
+Inspect `timing.rpt`, `route_status.rpt`, `utilization.rpt`, `drc.rpt`, and
+`power.rpt`. This project is intended for FPGA feasibility testing: **no physical
+I/O pins, external I/O delays, or board/PS interface are assigned**, so it is
+**not board-ready and should not be treated as a bitstream flow**.
+
+## Supported JSON features
+
+| Feature | Status |
+|---|---|
+| Pre-encoded Boolean input `[C,H,W]` or flat `[N]` | Supported |
+| Input `[6,32,32]` and `[12,32,32]` | Supported, subject to on-chip memory capacity |
+| Any number of linear `LUT6Conv2D` and `LUT6Dense` stages | Supported |
+| Conv2D channel-shared truth tables/connection vectors | Supported |
+| Conv2D per-output LUT parameters | Supported |
+| Conv kernel/stride/padding (integer, zero padding only) | Supported |
+| Conv→Dense flatten | Supported |
+| Variable tensor widths and class counts | Supported |
+| `BooleanGroupSum` (nonoverlapping intervals, possibly unequal) | Supported |
+| 64-bit INIT with pin0 as address LSB | Supported |
+| Raw RGB quantile/LBP encoder | **Not implemented**; `encoder_metadata` is not an encoder implementation |
+| Residual/skip connections and multi-branch graphs | **Not supported**; rejected |
+| Max pooling, arithmetic networks, non-Boolean features | **Not supported**; rejected |
+| Alternate head operations | **Not supported**; rejected |
+
+All compute layers must read their **immediate predecessor** (except implicit
+Conv→Dense flatten). The bridge never silently drops a layer or approximates an
+operation. Unsupported architectures must be represented in a new IR or backed by
+an explicit extension to the compiler/RTL.
+
+### Execution architecture
+
+1. `input_valid && input_ready` streams the input tensor one bit per clock in
+   the JSON's flatten order. A complete frame asserts `frame_ready`.
+2. `start && frame_ready` begins a new inference.
+3. A microprogram ROM supplies a 64-bit LUT INIT (or ID) and six addresses.
+4. Six sequential reads from the current ping-pong BRAM bank build a 6-bit LUT
+   truth-table address (padding sentinel supplies constant zero).
+5. The LUT result is written to the opposite bank. The final layer instead
+   increments exact class counters using the JSON's group intervals.
+6. `done` pulses for one clock. `scores_flat[i*SCORE_W +: SCORE_W]` holds the
+   raw count for class `i` until the next `start`.
+
+Two ping-pong banks are used regardless of the number of stages. Their depths
+are sized for the largest tensor assigned to each parity. Because the design
+executes one LUT at a time, latency scales roughly with logical LUT count and
+convolution padding, while simultaneous interconnect demand stays small.
+
+### Timing formula
+
+For the `full` layout, each LUT instruction takes
+`9 + 2 * (number_of_nonpadding_inputs)` clock cycles, i.e. 21 cycles for six
+real operands. For `split`, add one clock per instruction. These figures exclude
+serial input transfer and interface/idle overhead.
+
+### Memory use / realistic limitations
+
+The compiler optimizes address width based on model dimensions and can use a
+compact truth-table ROM, but it does **not** optimize all ROM duplication or
+hardware mapping. BRAM packing, LUTRAM substitution, device utilization, setup,
+and hold timing are device- and Vivado-dependent. In particular, a program that
+fits ZU3CG may overutilize XC7Z020 BRAM. Do not assume it will fit just because
+its theoretical number of stored bits is below FPGA capacity.
+
+## Developer tests
+
+From the bridge root:
+
+```powershell
+py -3 -m unittest discover -s tests -v
+```
+
+Tests cover alternative network depths and widths, 12-channel inputs, padding,
+per-output convolution LUTs, an exhaustive 4-input example, invalid graph
+rejection, ROM encode/decode round-trip, and a regression on the known 31,040-word
+model.
+
+Programmatic integration:
+
+```python
+from pathlib import Path
+from lut6_json_bridge.compiler import build
+
+manifest = build(
+    ir_path=Path("model_ir.json"),
+    out=Path("generated_fpga"),
+    encoding="full",          # or "split"
+    n_random=2,
+    seed=42,
+    clock_ns=10,
+    copy_ir=True,
+)
+print(manifest["program_instructions"])
+```
+
+## Notes on confidence
+
+1. **Proven from the original model:** 31,040-instruction `full` ROM matches the
+   previously routed project *byte for byte*; independently calculated class
+   scores match for software-generated vectors.
+2. **New RTL generator:** generalized, ping-pong memory engine with dynamic layer
+   boundaries and class groups; it requires a new XSim and Vivado run.
+3. **New `split` architecture:** software-verified, but no physical BRAM savings,
+   timing or routing claims until a new Vivado run is completed.
+4. **Golden score fidelity:** exact mathematical equality on sampled vectors, not
+   formal equivalence for every possible input. Additional validation against
+   the original PyTorch inference pipeline is recommended for raw image encoding.

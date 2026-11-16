@@ -20,6 +20,7 @@ import torch
 from ..compact import CandidateLogicLayer, UniformThermometerEncoder
 from ..config import ExperimentConfig
 from ..dense_freezing import enable_dense_group_freezing
+from ..heartbeat import HeartbeatQ2LocalEncoder
 from ..model import HybridFeatureEncoder, build_model_for_dataset, logic_layer_width_report
 from torchlogix.layers import GroupSum
 
@@ -34,7 +35,7 @@ class ArchitectureTracer(torch.fx.Tracer):
     """Trace wiring, not the internals of encoders or custom candidate kernels."""
 
     def is_leaf_module(self, module, qualified_name):
-        if isinstance(module, (CandidateLogicLayer, HybridFeatureEncoder,
+        if isinstance(module, (CandidateLogicLayer, HybridFeatureEncoder, HeartbeatQ2LocalEncoder,
                                UniformThermometerEncoder, GroupSum)):
             return True
         return super().is_leaf_module(module, qualified_name)
@@ -51,12 +52,15 @@ def architecture_graph(model):
     shapes = {}
     nodes, edges = [], []
     conv_index = dense_index = 0
+    image_shape = ((1, 187) if isinstance(model[0], HeartbeatQ2LocalEncoder)
+                   else (1, 28, 28) if isinstance(model[0], torch.nn.Identity)
+                   else (3, 32, 32))
     for node in graph.nodes:
         shape = None
         label = str(node.target)
         kind = node.op
         if node.op == "placeholder":
-            label, shape, kind = "RGB input", (3, 32, 32), "input"
+            label, shape, kind = "Image input", image_shape, "input"
         elif node.op == "call_module":
             module = modules[node.target]
             if isinstance(module, (HybridFeatureEncoder, UniformThermometerEncoder)):
@@ -67,6 +71,12 @@ def architecture_graph(model):
                     bits += (f" + LBP{module.num_lbp_bits}" if getattr(module, "num_lbp_bits", 0)
                              else f" + S{module.num_sine_bits}" if module.num_sine_bits else "")
                     label += "\n" + bits
+            elif isinstance(module, HeartbeatQ2LocalEncoder):
+                shape = (module.output_channels, 11, 17)
+                label, kind = "Heartbeat encoder\nQ2 + local2", "encoder"
+            elif isinstance(module, torch.nn.Identity) and node.target == "0":
+                shape = image_shape
+                label, kind = "Binary MNIST input", "encoder"
             elif isinstance(module, CandidateLogicLayer):
                 if module.is_convolution:
                     conv_index += 1
@@ -138,10 +148,10 @@ def load_checkpoint(checkpoint_path, *, config_path=None, device="cpu", backend=
         raise ValueError("Configuration must specify dataset, model_variant, and parametrization.")
     config = ExperimentConfig(**{k: v for k, v in configuration.items()
                                  if k in {f.name for f in fields(ExperimentConfig)}})
-    if config.dataset != "cifar10" or config.parametrization != "compact" or not (
+    if config.dataset not in {"cifar10", "cifar100", "mnist", "heartbeat"} or config.parametrization != "compact" or not (
         config.uses_compact_logic or config.uses_classrouted_compact_head
     ):
-        raise ValueError("This loader currently supports the CompactLogic CIFAR-10 model variants only.")
+        raise ValueError("This loader supports registered CompactLogic CIFAR-10, CIFAR-100, MNIST and Heartbeat variants only.")
     device = torch.device(device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise ValueError("CUDA was requested but is unavailable. Use --device cpu --backend torch.")

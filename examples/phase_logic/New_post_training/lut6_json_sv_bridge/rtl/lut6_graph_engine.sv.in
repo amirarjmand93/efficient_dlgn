@@ -1,0 +1,249 @@
+`timescale 1ns/1ps
+`default_nettype none
+// Sequential teacher LUT6 graph engine. All ROMs hold compile-time constants.
+// Input is pre-encoded Boolean CHW bits, loaded one bit per clock.
+module lut6_sequential(
+    input wire clk,
+    input wire rst,
+    input wire input_valid,
+    input wire input_bit,
+    output wire input_ready,
+    output wire frame_ready,
+    input wire start,
+    output wire busy,
+    output wire done,
+    output reg [__CLASS_W__-1:0] predicted_class,
+    output reg pred_valid__SCORES_PORT__
+);
+    localparam integer N_INPUT=__N_INPUT__, N_PROGRAM=__N_PROGRAM__;
+    localparam integer N_VALUES=__N_VALUES__, N_TRUTH=__N_TRUTH__;
+    localparam integer N_SUM=__N_SUM__, N_CLASSES=__N_CLASSES__;
+    localparam integer ADDR_W=__ADDR_W__, ID_W=__ID_W__;
+    localparam integer SCORE_W=__SCORE_W__, CLASS_W=__CLASS_W__;
+    localparam integer SUM_W=__SUM_W__, PC_W=__PC_W__, LOAD_W=__LOAD_W__;
+    localparam integer REC_MAX_W=6*ADDR_W+ID_W;
+    localparam integer SUM_ADDR_DEPTH=(N_SUM+1)/2;
+    localparam integer SUM_INV_DEPTH=(N_SUM+15)/16;
+
+    localparam [4:0] S_LOAD=0, S_READY=1, S_KIND=2, S_REC=3,
+                     S_TRUTH=4, S_PIN=5, S_MEM=6, S_SAMPLE=7,
+                     S_EXEC=8, S_SUM_FETCH=9, S_SUM_ADDR=10,
+                     S_SUM_MEM=11, S_SUM_ACC=12, S_DONE=13;
+    reg [4:0] state;
+    reg [LOAD_W-1:0] load_index;
+    reg [PC_W-1:0] pc;
+    reg [2:0] kind_q, pin_index;
+    reg [5:0] lut_addr;
+    reg [ADDR_W-1:0] read_addr;
+    reg value_q;
+    reg [63:0] truth_q;
+    reg [SUM_W-1:0] sum_index, class_pos;
+    reg [CLASS_W-1:0] class_index;
+    reg [2*ADDR_W-1:0] sum_pair_q;
+    reg [15:0] sum_inv_word_q;
+    reg sum_inv_q;
+    reg [SCORE_W-1:0] class_counts[0:N_CLASSES-1];
+
+__SCORES_ASSIGN__
+
+    // Balanced ArgMax tree. The left child has the lower class index, so
+    // choosing it on equality makes ties deterministic. The final class
+    // count includes the bit accumulated on the transition into S_DONE.
+    localparam integer ARG_LEAVES=1 << $clog2(N_CLASSES);
+    wire [SCORE_W-1:0] arg_score[1:2*ARG_LEAVES-1];
+    wire [CLASS_W-1:0] arg_class[1:2*ARG_LEAVES-1];
+    genvar a;
+    generate
+        for(a=0;a<ARG_LEAVES;a=a+1) begin: arg_leaf
+            if(a<N_CLASSES) begin
+                if(a==N_CLASSES-1) begin
+                    assign arg_score[ARG_LEAVES+a]=class_counts[a]
+                        + (value_q ^ sum_inv_q);
+                end else begin
+                    assign arg_score[ARG_LEAVES+a]=class_counts[a];
+                end
+            end else begin
+                assign arg_score[ARG_LEAVES+a]={SCORE_W{1'b0}};
+            end
+            assign arg_class[ARG_LEAVES+a]=CLASS_W'(a);
+        end
+        for(a=1;a<ARG_LEAVES;a=a+1) begin: arg_node
+            assign arg_score[a]=(arg_score[2*a]>=arg_score[2*a+1])
+                ? arg_score[2*a] : arg_score[2*a+1];
+            assign arg_class[a]=(arg_score[2*a]>=arg_score[2*a+1])
+                ? arg_class[2*a] : arg_class[2*a+1];
+        end
+    endgenerate
+
+    function automatic [SUM_W-1:0] class_length(input [CLASS_W-1:0] c);
+        begin
+            case(c)
+__CLASS_LENGTH__
+                default: class_length=0;
+            endcase
+        end
+    endfunction
+    function automatic [SCORE_W-1:0] class_offset(input [CLASS_W-1:0] c);
+        begin
+            case(c)
+__CLASS_OFFSET__
+                default: class_offset=0;
+            endcase
+        end
+    endfunction
+
+    (* rom_style="block" *) reg [2:0] kind_mem[0:N_PROGRAM-1];
+    initial $readmemh("lut6_kind.mem", kind_mem);
+    always @(posedge clk) if (state==S_KIND) kind_q <= kind_mem[pc];
+
+__RECORD_MEMORIES__
+
+    reg [REC_MAX_W-1:0] rec_word;
+    always @* begin
+        rec_word=0;
+        case(kind_q)
+__RECORD_SELECT__
+            default: rec_word=0;
+        endcase
+    end
+    wire [ID_W-1:0] truth_id =
+        (rec_word >> ((kind_q+1)*ADDR_W)) & ((1<<ID_W)-1);
+    wire [ADDR_W-1:0] operand_addr = rec_word[pin_index*ADDR_W +: ADDR_W];
+
+    (* rom_style="block" *) reg [63:0] truth_mem[0:N_TRUTH-1];
+    initial $readmemh("lut6_truth.mem", truth_mem);
+    always @(posedge clk) if (state==S_TRUTH) truth_q <= truth_mem[truth_id];
+
+    (* rom_style="block" *) reg [2*ADDR_W-1:0]
+        sum_addr_mem[0:SUM_ADDR_DEPTH-1];
+    (* rom_style="block" *) reg [15:0] sum_inv_mem[0:SUM_INV_DEPTH-1];
+    initial begin
+        $readmemh("lut6_sum_addr.mem",sum_addr_mem);
+        $readmemh("lut6_sum_inv.mem",sum_inv_mem);
+    end
+    always @(posedge clk) if(state==S_SUM_FETCH) begin
+        sum_pair_q <= sum_addr_mem[sum_index >> 1];
+        sum_inv_word_q <= sum_inv_mem[sum_index >> 4];
+    end
+
+    // One randomly addressed bit store retains graph values until no longer
+    // needed. No reset on this memory, so it can infer BRAM.
+    (* ram_style="block" *) reg values_mem[0:N_VALUES-1];
+    wire value_we=(state==S_LOAD && input_valid) || state==S_EXEC;
+    wire [ADDR_W-1:0] value_write_addr =
+        state==S_LOAD ? load_index : (N_INPUT+pc);
+    wire value_write_bit = state==S_LOAD ? input_bit : truth_q[lut_addr];
+    always @(posedge clk) begin
+        if(value_we) values_mem[value_write_addr] <= value_write_bit;
+        if(state==S_MEM || state==S_SUM_MEM)
+            value_q <= values_mem[read_addr];
+    end
+
+    assign input_ready=(state==S_LOAD);
+    assign frame_ready=(state==S_READY);
+    assign busy=(state>=S_KIND && state<=S_SUM_ACC);
+    assign done=(state==S_DONE);
+
+    integer i;
+    always @(posedge clk) begin
+        if(rst) begin
+            state<=S_LOAD;
+            load_index<=0;
+            pc<=0;
+            pin_index<=0;
+            lut_addr<=0;
+            read_addr<=0;
+            sum_index<=0;
+            class_index<=0;
+            class_pos<=0;
+            sum_inv_q<=0;
+            predicted_class<=0;
+            pred_valid<=0;
+            for(i=0;i<N_CLASSES;i=i+1) class_counts[i]<=0;
+__RECORD_RESET__
+        end else begin
+        pred_valid<=0;
+        case(state)
+            S_LOAD: if(input_valid) begin
+                if(load_index==N_INPUT-1) begin
+                    load_index<=0;
+                    state<=S_READY;
+                end else load_index<=load_index+1'b1;
+            end
+            S_READY: if(start) begin
+                pc<=0;
+                pin_index<=0;
+                lut_addr<=0;
+                sum_index<=0;
+                class_index<=0;
+                class_pos<=0;
+                for(i=0;i<N_CLASSES;i=i+1)
+                    class_counts[i]<=class_offset(i);
+__RECORD_RESET__
+                state<=S_KIND;
+            end
+            S_KIND: state<=S_REC;
+            S_REC: state<=S_TRUTH;
+            S_TRUTH: begin
+                pin_index<=0;
+                lut_addr<=0;
+                state<=S_PIN;
+            end
+            S_PIN: if(pin_index==kind_q+1'b1) state<=S_EXEC;
+                   else begin
+                       read_addr<=operand_addr;
+                       state<=S_MEM;
+                   end
+            S_MEM: state<=S_SAMPLE;
+            S_SAMPLE: begin
+                lut_addr[pin_index]<=value_q;
+                pin_index<=pin_index+1'b1;
+                state<=S_PIN;
+            end
+            S_EXEC: begin
+                case(kind_q)
+__RECORD_ADVANCE__
+                    default: ;
+                endcase
+                if(pc==N_PROGRAM-1) begin
+                    sum_index<=0;
+                    class_index<=0;
+                    class_pos<=0;
+                    state<=S_SUM_FETCH;
+                end else begin
+                    pc<=pc+1'b1;
+                    state<=S_KIND;
+                end
+            end
+            S_SUM_FETCH: state<=S_SUM_ADDR;
+            S_SUM_ADDR: begin
+                read_addr<=sum_index[0] ? sum_pair_q[2*ADDR_W-1:ADDR_W]
+                                        : sum_pair_q[ADDR_W-1:0];
+                sum_inv_q<=sum_inv_word_q[sum_index & 4'hF];
+                state<=S_SUM_MEM;
+            end
+            S_SUM_MEM: state<=S_SUM_ACC;
+            S_SUM_ACC: begin
+                class_counts[class_index] <= class_counts[class_index]
+                                            + (value_q ^ sum_inv_q);
+                if(sum_index==N_SUM-1) begin
+                    predicted_class<=arg_class[1];
+                    pred_valid<=1;
+                    state<=S_DONE;
+                end
+                else begin
+                    sum_index<=sum_index+1'b1;
+                    if(class_pos==class_length(class_index)-1'b1) begin
+                        class_pos<=0;
+                        class_index<=class_index+1'b1;
+                    end else class_pos<=class_pos+1'b1;
+                    state<=S_SUM_FETCH;
+                end
+            end
+            S_DONE: state<=S_LOAD;
+            default: state<=S_LOAD;
+        endcase
+        end
+    end
+endmodule
+`default_nettype wire

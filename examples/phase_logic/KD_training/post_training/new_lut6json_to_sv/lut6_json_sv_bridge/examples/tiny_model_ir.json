@@ -1,0 +1,302 @@
+{
+  "format": "hls4ml_lut6_ir_v1",
+  "input": {
+    "name": "encoded_input",
+    "dtype": "boolean",
+    "shape": [
+      2,
+      4,
+      4
+    ],
+    "layout": "CHW",
+    "flattening": {
+      "order": "channel,row,column"
+    }
+  },
+  "layers": [
+    {
+      "name": "conv1",
+      "op_type": "LUT6Conv2D",
+      "input": "encoded_input",
+      "input_shape": [
+        2,
+        4,
+        4
+      ],
+      "output_shape": [
+        3,
+        3,
+        3
+      ],
+      "kernel_size": [
+        2,
+        2
+      ],
+      "stride": [
+        1,
+        1
+      ],
+      "padding": [
+        0,
+        0
+      ],
+      "padding_value": 0,
+      "local_patch_flattening": {
+        "order": "channel,row,column"
+      },
+      "connections": [
+        [
+          6,
+          6,
+          3,
+          2,
+          3,
+          3
+        ],
+        [
+          2,
+          1,
+          4,
+          6,
+          1,
+          7
+        ],
+        [
+          3,
+          6,
+          3,
+          5,
+          6,
+          3
+        ]
+      ],
+      "init_hex": [
+        "7623C4DD26FB984F",
+        "2DD301C8A91AFA5C",
+        "91215785D9977338"
+      ],
+      "pin0_is_address_lsb": true,
+      "weight_sharing": {
+        "parameter_index": "output_channel"
+      }
+    },
+    {
+      "name": "dense1",
+      "op_type": "LUT6Dense",
+      "input": "conv1",
+      "input_shape": [
+        27
+      ],
+      "output_shape": [
+        8
+      ],
+      "connections": [
+        [
+          10,
+          2,
+          22,
+          16,
+          21,
+          24
+        ],
+        [
+          2,
+          15,
+          10,
+          12,
+          1,
+          8
+        ],
+        [
+          17,
+          0,
+          13,
+          6,
+          11,
+          17
+        ],
+        [
+          2,
+          14,
+          16,
+          6,
+          19,
+          14
+        ],
+        [
+          1,
+          11,
+          4,
+          6,
+          22,
+          5
+        ],
+        [
+          23,
+          25,
+          14,
+          19,
+          5,
+          16
+        ],
+        [
+          21,
+          5,
+          1,
+          3,
+          0,
+          5
+        ],
+        [
+          15,
+          21,
+          26,
+          13,
+          2,
+          13
+        ]
+      ],
+      "init_hex": [
+        "16055583A1CBB723",
+        "4F4F81B02495DA17",
+        "0173745F9E0D5425",
+        "5467115B618D3F43",
+        "85FDADC422C4D84F",
+        "3367433467C3B9FE",
+        "C986FA9FE6647183",
+        "0E2EB028F94CF6B0"
+      ],
+      "pin0_is_address_lsb": true
+    },
+    {
+      "name": "dense2",
+      "op_type": "LUT6Dense",
+      "input": "dense1",
+      "input_shape": [
+        8
+      ],
+      "output_shape": [
+        10
+      ],
+      "connections": [
+        [
+          3,
+          7,
+          4,
+          6,
+          2,
+          5
+        ],
+        [
+          7,
+          0,
+          2,
+          2,
+          6,
+          1
+        ],
+        [
+          1,
+          1,
+          2,
+          4,
+          2,
+          2
+        ],
+        [
+          6,
+          2,
+          3,
+          5,
+          7,
+          3
+        ],
+        [
+          4,
+          1,
+          5,
+          2,
+          1,
+          4
+        ],
+        [
+          0,
+          0,
+          5,
+          3,
+          6,
+          6
+        ],
+        [
+          5,
+          6,
+          6,
+          6,
+          5,
+          1
+        ],
+        [
+          2,
+          0,
+          5,
+          6,
+          7,
+          3
+        ],
+        [
+          4,
+          3,
+          4,
+          1,
+          5,
+          3
+        ],
+        [
+          3,
+          6,
+          4,
+          7,
+          1,
+          7
+        ]
+      ],
+      "init_hex": [
+        "F6BC08476BCDCF54",
+        "41972530E85C3B23",
+        "80CE7B5711D65409",
+        "E83EA1204B040005",
+        "DFE55489AF4F905A",
+        "C9C7BF7552129007",
+        "8882AFE07A231EBE",
+        "EE09635720957319",
+        "41BFFCFDE561219A",
+        "E1AF27306E50E655"
+      ],
+      "pin0_is_address_lsb": true
+    },
+    {
+      "name": "group_sum",
+      "op_type": "BooleanGroupSum",
+      "input": "dense2",
+      "input_shape": [
+        10
+      ],
+      "output_shape": [
+        2
+      ],
+      "classes": 2,
+      "class_groups": [
+        {
+          "class_index": 0,
+          "node_start": 0,
+          "node_stop_exclusive": 5
+        },
+        {
+          "class_index": 1,
+          "node_start": 5,
+          "node_stop_exclusive": 10
+        }
+      ]
+    }
+  ]
+}

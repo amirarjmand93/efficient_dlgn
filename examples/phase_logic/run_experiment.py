@@ -44,13 +44,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--input-encoding",
         choices=INPUT_ENCODINGS,
         default="fixed",
-        help="CIFAR input encoding mode.",
+        help="CIFAR input encoding mode, or heartbeat Q2 plus local comparisons.",
     )
     parser.add_argument(
         "--hybrid-features",
         choices=("sine", "lbp"),
         default="sine",
-        help="Hybrid feature branch: existing sine bits, or Q2 + two local comparison bits.",
+        help="Hybrid feature branch: sine bits, CIFAR LBP bits, or heartbeat temporal comparisons.",
     )
     parser.add_argument(
         "--num-input-bits",
@@ -143,6 +143,21 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Opt in to ELAR: Conv1-3 75%% uniform + 25%% AND/OR; Conv4 uniform; Dense1 uniform/identity/NOT/constants=70/18/8/4%%; Dense2=80/12/6/2%%. Do not combine with the original layer-aware flag.")
     parser.add_argument("--compact-aggressive-layer-aware-resampling", action="store_true",
                         help="Separate aggressive policy: Conv1-3 75%% uniform + 25%% AND/OR; Conv4 uniform; Dense1 uniform/identity/NOT/constants=50/30/5/15%%; Dense2=60/25/5/10%%. Do not combine with other layer-aware flags.")
+    infusion_group = parser.add_mutually_exclusive_group()
+    infusion_group.add_argument("--compact-progressive-aggressive-infusion", action="store_true",
+                                help="Adaptive five-level validation-gated aggressive candidate infusion. Do not combine with other layer-aware flags.")
+    infusion_group.add_argument("--compact-progressive-aggressive-infusion-unary-biased", action="store_true",
+                                help="Use the separate five-level unary-biased infusion schedule, with constants fixed at 15%%.")
+    parser.add_argument("--compact-control-holdout", action="store_true",
+                        help="Use the same fixed 10%% validation holdout as progressive infusion, without enabling infusion.")
+    parser.add_argument("--compact-infusion-start-level", type=int, default=1, choices=range(1, 6), metavar="{1,2,3,4,5}",
+                        help="Initial progressive infusion level (default: 1). Applies from the first training step.")
+    parser.add_argument("--compact-infusion-scope", choices=("all", "conv", "dense"), default="all",
+                        help="Apply progressive infusion to all layers (default), Conv1-3 only, or Dense1-2 only.")
+    parser.add_argument("--compact-infusion-level-1-only", action="store_true",
+                        help="Hold the selected infusion scope at Level 1 throughout training.")
+    parser.add_argument("--compact-infusion-resume-checkpoint", type=Path, default=None,
+                        help="Resume progressive infusion from a safe or best training checkpoint.")
     parser.add_argument("--compact-freeze-patience", type=int, default=200)
     parser.add_argument("--compact-freeze-mode", choices=("none", "entropy", "hybrid"), default="entropy",
                         help="Disable freezing (none), original entropy freezing, or probe-driven hybrid freezing. Exploration resampling is unchanged.")
@@ -223,6 +238,19 @@ def config_from_args(args: argparse.Namespace, experiment: str | None = None):
         compact_layer_aware_resampling=args.compact_layer_aware_resampling,
         compact_efficient_layer_aware_resampling=args.compact_efficient_layer_aware_resampling,
         compact_aggressive_layer_aware_resampling=args.compact_aggressive_layer_aware_resampling,
+        compact_progressive_aggressive_infusion=(
+            args.compact_progressive_aggressive_infusion
+            or args.compact_progressive_aggressive_infusion_unary_biased
+        ),
+        compact_infusion_schedule=(
+            "unary_biased" if args.compact_progressive_aggressive_infusion_unary_biased
+            else "aggressive"
+        ),
+        compact_control_holdout=args.compact_control_holdout,
+        compact_infusion_start_level=args.compact_infusion_start_level,
+        compact_infusion_scope=args.compact_infusion_scope,
+        compact_infusion_level_1_only=args.compact_infusion_level_1_only,
+        compact_infusion_resume_checkpoint=args.compact_infusion_resume_checkpoint,
         compact_freeze_patience=args.compact_freeze_patience,
         compact_freeze_mode=args.compact_freeze_mode,
         compact_freeze_min_interval=args.compact_freeze_min_interval,

@@ -299,11 +299,11 @@ class CompactLogicController:
         self.convs = [(name, layer) for name, layer in self.layers if layer.is_convolution]
         efficient = getattr(config, "compact_efficient_layer_aware_resampling", False)
         aggressive = getattr(config, "compact_aggressive_layer_aware_resampling", False)
-        if aggressive and (efficient or getattr(config, "compact_layer_aware_resampling", False)):
+        progressive = getattr(config, "compact_progressive_aggressive_infusion", False)
+        original = getattr(config, "compact_layer_aware_resampling", False)
+        if sum(map(bool, (original, efficient, aggressive, progressive))) > 1:
             raise ValueError("Choose only one layer-aware resampling strategy.")
-        if efficient and getattr(config, "compact_layer_aware_resampling", False):
-            raise ValueError("Choose only one layer-aware resampling strategy.")
-        if getattr(config, "compact_layer_aware_resampling", False):
+        if original:
             dense = [layer for _, layer in self.layers if not layer.is_convolution]
             if len(self.convs) != 4 or len(dense) != 2:
                 raise ValueError("Layer-aware resampling requires four convolutions and two dense layers.")
@@ -326,6 +326,12 @@ class CompactLogicController:
                 layer.resample_preferred_ops = (1, 7)
             dense[0].resample_efficient_dense = (0.30, 0.05, 0.15)
             dense[1].resample_efficient_dense = (0.25, 0.05, 0.10)
+        if progressive:
+            from .infusion_training import apply_infusion_level
+            apply_infusion_level(
+                model, 1, scope=getattr(config, "compact_infusion_scope", "all"),
+                schedule=getattr(config, "compact_infusion_schedule", "aggressive"),
+            )
         self.exploration_steps = config.compact_exploration_steps
         self.resample_patience = config.compact_resample_patience
         self.freeze_patience = config.compact_freeze_patience

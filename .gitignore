@@ -43,6 +43,7 @@ logc_env
 # Local FPGA tools and generated post-training artifacts
 /downloads/
 /examples/phase_logic/post_training/outputs/
+/examples/phase_logic/KD_training/post_training/outputs/
 /examples/phase_logic/post_training/modified_verilog_pr/generated/
 **/__pycache__/
 .Xil/
@@ -50,3 +51,21 @@ logc_env
 /Conv3
 /Dense1
 /source
+
+# Local experiment plots, reports, logs, and Vivado session files
+examples/phase_logic/plots/
+examples/phase_logic/post_training/modified_verilog_pr/analysis_reports/
+logs/
+hs_err_pid*.log
+vivado.log
+vivado.jou
+vivado_*.backup.log
+vivado_*.backup.jou
+
+# Local exploratory test files
+tests/test_compact_head_noskip.py
+tests/test_continuous_adaptive_infusion.py
+tests/test_kd_infusion_training.py
+tests/test_kd_staged_freezing.py
+tests/test_progressive_aggressive_infusion.py
+tests/test_student_circuit_exporter.py

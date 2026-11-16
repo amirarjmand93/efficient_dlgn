@@ -1,0 +1,15 @@
+{
+  "format": "torchlogix_native_lut6_circuit_v1",
+  "input_shape": [3],
+  "score_bits": 5,
+  "metadata": {"pin0_is_address_lsb": true},
+  "gates": [
+    {"gate_id": 7, "inputs": [{"source": 0, "inverted": false}, {"source": 1, "inverted": false}, {"source": -1, "inverted": false}, {"source": -1, "inverted": false}, {"source": -1, "inverted": false}, {"source": -1, "inverted": false}], "init_hex": "8888888888888888"},
+    {"gate_id": 9, "inputs": [{"source": 7, "inverted": false}, {"source": 2, "inverted": false}, {"source": -1, "inverted": false}, {"source": -1, "inverted": false}, {"source": -1, "inverted": false}, {"source": -1, "inverted": false}], "init_hex": "6666666666666666"},
+    {"gate_id": 10, "inputs": [{"source": 0, "inverted": false}, {"source": -1, "inverted": false}, {"source": -1, "inverted": false}, {"source": -1, "inverted": false}, {"source": -1, "inverted": false}, {"source": -1, "inverted": false}], "init_hex": "5555555555555555"}
+  ],
+  "sums": [
+    {"signals": [{"source": 9, "inverted": false}, {"source": 7, "inverted": false}, {"source": 9, "inverted": true}], "offset": 2},
+    {"signals": [{"source": 10, "inverted": false}, {"source": 1, "inverted": false}, {"source": 1, "inverted": false}], "offset": 1}
+  ]
+}

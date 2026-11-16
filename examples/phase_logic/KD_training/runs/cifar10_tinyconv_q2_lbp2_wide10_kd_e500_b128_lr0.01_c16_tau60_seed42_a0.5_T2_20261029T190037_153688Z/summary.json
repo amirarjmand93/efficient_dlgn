@@ -1,0 +1,8 @@
+{
+  "best_epoch": 447,
+  "validation_discrete": {
+    "loss": 1.2586200040817261,
+    "accuracy": 0.568
+  },
+  "test_evaluated": false
+}

@@ -2208,3 +2208,434 @@ def _simplify_gate(op, in0, in1, a_const, b_const):
         if b_const is False:  return GateOp.NOT, in0, -1, None
 
     return op, in0, in1, None
+
+
+# ---------------------------------------------------------------------------
+# Native six-input LUT circuit
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class LUT6Signal:
+    """Reference to an input/LUT output, optionally inverted; source -1 is FALSE."""
+
+    source: int
+    inverted: bool = False
+
+
+@dataclass(frozen=True)
+class LUT6Gate:
+    gate_id: int
+    inputs: tuple[LUT6Signal, ...]
+    init: int
+    layer: str = ""
+    name: str = ""
+
+    def __post_init__(self):
+        if len(self.inputs) != 6:
+            raise ValueError("A native LUT6 gate requires exactly six inputs.")
+        if not 0 <= self.init < (1 << 64):
+            raise ValueError("LUT6 INIT must be an unsigned 64-bit value.")
+
+
+@dataclass(frozen=True)
+class LUT6SumReduction:
+    signals: tuple[LUT6Signal, ...]
+    offset: int = 0
+
+
+class NativeLUT6Circuit:
+    """Combinational native-LUT6 DAG with exact integer sum reductions.
+
+    This complements :class:`Circuit`, whose Gate IR intentionally represents
+    one- and two-input Boolean operations. LUT6 nodes stay native rather than
+    being expanded into a large network of binary gates.
+    """
+
+    FORMAT = "torchlogix_native_lut6_circuit_v1"
+
+    def __init__(self, input_shape, gates, sums, *, metadata=None, score_bits=16):
+        self.input_shape = tuple(int(value) for value in input_shape)
+        self.n_inputs = int(np.prod(self.input_shape))
+        self.gates = list(gates)
+        self.sums = list(sums)
+        self.metadata = dict(metadata or {})
+        self.score_bits = int(score_bits)
+        if self.score_bits < 1:
+            raise ValueError("score_bits must be positive.")
+        previous = self.n_inputs - 1
+        seen = set()
+        for gate in self.gates:
+            if gate.gate_id < self.n_inputs or gate.gate_id <= previous or gate.gate_id in seen:
+                raise ValueError("LUT6 gate IDs must be unique and topologically increasing.")
+            for signal in gate.inputs:
+                if signal.source >= gate.gate_id:
+                    raise ValueError("LUT6 gate input must precede its output.")
+                if signal.source < -1:
+                    raise ValueError("Invalid LUT6 signal source.")
+                if signal.source >= self.n_inputs and signal.source not in seen:
+                    raise ValueError("LUT6 gate references a missing earlier gate.")
+            previous = gate.gate_id
+            seen.add(gate.gate_id)
+        valid_sources = set(range(self.n_inputs)) | seen | {-1}
+        for reduction in self.sums:
+            if reduction.offset < 0 or any(signal.source not in valid_sources for signal in reduction.signals):
+                raise ValueError("Invalid LUT6 sum reduction.")
+
+    @staticmethod
+    def _resolve(signal, aliases):
+        source, inverted = signal.source, signal.inverted
+        visited = set()
+        while source in aliases:
+            if source in visited:
+                raise ValueError("Cycle in LUT6 alias map.")
+            visited.add(source)
+            replacement = aliases[source]
+            source, inverted = replacement.source, inverted ^ replacement.inverted
+        return LUT6Signal(source, inverted)
+
+    @staticmethod
+    def _reduce_gate(inputs, init):
+        """Cofactor constants/aliases and return either a signal or normalized LUT6."""
+        sources = []
+        for signal in inputs:
+            if signal.source >= 0 and signal.source not in sources:
+                sources.append(signal.source)
+        outputs = []
+        for assignment in range(1 << len(sources)):
+            values = {source: bool(assignment & (1 << index))
+                      for index, source in enumerate(sources)}
+            address = 0
+            for pin, signal in enumerate(inputs):
+                value = False if signal.source == -1 else values[signal.source]
+                value ^= signal.inverted
+                address |= int(value) << pin
+            outputs.append(bool((init >> address) & 1))
+        if all(value == outputs[0] for value in outputs):
+            return LUT6Signal(-1, outputs[0])
+        for index, source in enumerate(sources):
+            variable = [bool(assignment & (1 << index))
+                        for assignment in range(1 << len(sources))]
+            if outputs == variable:
+                return LUT6Signal(source, False)
+            if outputs == [not value for value in variable]:
+                return LUT6Signal(source, True)
+        normalized_inputs = tuple(
+            [LUT6Signal(source) for source in sources]
+            + [LUT6Signal(-1)] * (6 - len(sources))
+        )
+        normalized_init = 0
+        mask = (1 << len(sources)) - 1
+        for address in range(64):
+            if outputs[address & mask]:
+                normalized_init |= 1 << address
+        return normalized_inputs, normalized_init
+
+    def simplified(self):
+        """Return an equivalent circuit after propagation, deduplication and DCE."""
+        aliases = {}
+        canonical = {}
+        kept = []
+        for gate in self.gates:
+            inputs = tuple(self._resolve(signal, aliases) for signal in gate.inputs)
+            reduced = self._reduce_gate(inputs, gate.init)
+            if isinstance(reduced, LUT6Signal):
+                aliases[gate.gate_id] = reduced
+                continue
+            reduced_inputs, reduced_init = reduced
+            key = (reduced_inputs, reduced_init)
+            if key in canonical:
+                aliases[gate.gate_id] = LUT6Signal(canonical[key])
+                continue
+            canonical[key] = gate.gate_id
+            kept.append(LUT6Gate(
+                gate.gate_id, reduced_inputs, reduced_init,
+                layer=gate.layer, name=gate.name,
+            ))
+
+        reductions = []
+        for reduction in self.sums:
+            offset = reduction.offset
+            signals = []
+            for original in reduction.signals:
+                signal = self._resolve(original, aliases)
+                if signal.source == -1:
+                    offset += int(signal.inverted)
+                else:
+                    signals.append(signal)
+            reductions.append(LUT6SumReduction(tuple(signals), offset))
+
+        by_id = {gate.gate_id: gate for gate in kept}
+        live = set()
+
+        def mark(signal):
+            if signal.source < self.n_inputs or signal.source in live:
+                return
+            gate = by_id.get(signal.source)
+            if gate is None:
+                raise ValueError(f"Missing LUT6 source {signal.source} after simplification.")
+            live.add(signal.source)
+            for child in gate.inputs:
+                mark(child)
+
+        for reduction in reductions:
+            for signal in reduction.signals:
+                mark(signal)
+        kept = [gate for gate in kept if gate.gate_id in live]
+        return NativeLUT6Circuit(
+            self.input_shape, kept, reductions,
+            metadata=self.metadata, score_bits=self.score_bits,
+        )
+
+    def gate_counts_by_layer(self):
+        counts = {}
+        for gate in self.gates:
+            counts[gate.layer] = counts.get(gate.layer, 0) + 1
+        return counts
+
+    @staticmethod
+    def _signal_values(signal, values):
+        if signal.source == -1:
+            result = np.zeros(values.shape[0], dtype=np.uint8)
+        else:
+            result = values[:, signal.source]
+        return result ^ np.uint8(signal.inverted)
+
+    def __call__(self, inputs):
+        array = np.asarray(inputs)
+        if array.ndim == len(self.input_shape):
+            array = array[None, ...]
+        if array.ndim != len(self.input_shape) + 1 or tuple(array.shape[1:]) != self.input_shape:
+            raise ValueError(f"Expected LUT6 circuit input shape [N,{self.input_shape}].")
+        if not np.isin(array, (0, 1)).all():
+            raise ValueError("LUT6 circuit inputs must be Boolean.")
+        maximum = max([self.n_inputs - 1] + [gate.gate_id for gate in self.gates])
+        values = np.zeros((len(array), maximum + 1), dtype=np.uint8)
+        values[:, :self.n_inputs] = array.reshape(len(array), -1).astype(np.uint8)
+        powers = np.arange(6, dtype=np.uint8)
+        for gate in self.gates:
+            pins = np.stack([self._signal_values(signal, values) for signal in gate.inputs], axis=1)
+            address = (pins << powers).sum(1, dtype=np.uint8)
+            values[:, gate.gate_id] = (
+                np.right_shift(np.uint64(gate.init), address.astype(np.uint64)) & np.uint64(1)
+            ).astype(np.uint8)
+        result = np.zeros((len(array), len(self.sums)), dtype=np.uint16)
+        for index, reduction in enumerate(self.sums):
+            result[:, index] = reduction.offset
+            for signal in reduction.signals:
+                result[:, index] += self._signal_values(signal, values)
+        return result
+
+    @staticmethod
+    def _signal_dict(signal):
+        return {"source": signal.source, "inverted": signal.inverted}
+
+    @staticmethod
+    def _signal_from_dict(value):
+        return LUT6Signal(int(value["source"]), bool(value.get("inverted", False)))
+
+    def to_dict(self):
+        return {
+            "format": self.FORMAT,
+            "input_shape": list(self.input_shape),
+            "score_bits": self.score_bits,
+            "metadata": self.metadata,
+            "gates": [{
+                "gate_id": gate.gate_id,
+                "inputs": [self._signal_dict(signal) for signal in gate.inputs],
+                "init_hex": f"{gate.init:016X}",
+                "layer": gate.layer,
+                "name": gate.name,
+            } for gate in self.gates],
+            "sums": [{
+                "signals": [self._signal_dict(signal) for signal in reduction.signals],
+                "offset": reduction.offset,
+            } for reduction in self.sums],
+        }
+
+    @classmethod
+    def from_dict(cls, value):
+        if value.get("format") != cls.FORMAT:
+            raise ValueError("Unsupported native LUT6 circuit JSON format.")
+        gates = [LUT6Gate(
+            int(gate["gate_id"]),
+            tuple(cls._signal_from_dict(signal) for signal in gate["inputs"]),
+            int(gate["init_hex"], 16),
+            layer=str(gate.get("layer", "")), name=str(gate.get("name", "")),
+        ) for gate in value["gates"]]
+        sums = [LUT6SumReduction(
+            tuple(cls._signal_from_dict(signal) for signal in reduction["signals"]),
+            int(reduction.get("offset", 0)),
+        ) for reduction in value["sums"]]
+        return cls(value["input_shape"], gates, sums,
+                   metadata=value.get("metadata"), score_bits=int(value.get("score_bits", 16)))
+
+    def write_json(self, path):
+        with open(path, "w") as handle:
+            json.dump(self.to_dict(), handle, indent=2)
+            handle.write("\n")
+
+    @classmethod
+    def from_json_file(cls, path):
+        with open(path) as handle:
+            return cls.from_dict(json.load(handle))
+
+    def _c_signal(self, signal):
+        if signal.source == -1:
+            expression = "0"
+        elif signal.source < self.n_inputs:
+            expression = f"inp[{signal.source}]"
+        else:
+            expression = f"nodes[{signal.source}]"
+        return f"(uint8_t)!({expression})" if signal.inverted else expression
+
+    def get_c_code(self):
+        maximum = max([self.n_inputs - 1] + [gate.gate_id for gate in self.gates])
+        lines = [
+            "/* Auto-generated native-LUT6 circuit. */",
+            "#include <stdint.h>",
+            "",
+            "static uint8_t lut6(uint64_t init, uint8_t i0, uint8_t i1, uint8_t i2,",
+            "                    uint8_t i3, uint8_t i4, uint8_t i5) {",
+            "    unsigned address = i0 | (i1 << 1) | (i2 << 2) | (i3 << 3) | (i4 << 4) | (i5 << 5);",
+            "    return (uint8_t)((init >> address) & UINT64_C(1));",
+            "}",
+            "",
+            f"void circuit(const uint8_t inp[{self.n_inputs}], uint16_t scores[{len(self.sums)}]) {{",
+            f"    uint8_t nodes[{maximum + 1}];",
+        ]
+        for gate in self.gates:
+            arguments = ", ".join(self._c_signal(signal) for signal in gate.inputs)
+            lines.append(
+                f"    nodes[{gate.gate_id}] = lut6(UINT64_C(0x{gate.init:016X}), {arguments});"
+            )
+        for index, reduction in enumerate(self.sums):
+            lines.append(f"    uint16_t sum_{index} = {reduction.offset};")
+            for signal in reduction.signals:
+                lines.append(f"    sum_{index} += {self._c_signal(signal)};")
+            lines.append(f"    scores[{index}] = sum_{index};")
+        lines.extend(["}", ""])
+        return "\n".join(lines)
+
+    def evaluate_compiled(self, inputs, *, opt_level=0):
+        import ctypes
+        import subprocess
+        import tempfile
+
+        if opt_level not in (0, 1, 2, 3):
+            raise ValueError("C optimization level must be 0, 1, 2 or 3.")
+        array = np.asarray(inputs, dtype=np.uint8)
+        if array.ndim == len(self.input_shape):
+            array = array[None, ...]
+        if array.ndim != len(self.input_shape) + 1 or tuple(array.shape[1:]) != self.input_shape:
+            raise ValueError(f"Expected LUT6 circuit input shape [N,{self.input_shape}].")
+        if not np.isin(array, (0, 1)).all():
+            raise ValueError("LUT6 circuit inputs must be Boolean.")
+        with tempfile.TemporaryDirectory(prefix="torchlogix_lut6_") as directory:
+            c_path = f"{directory}/circuit.c"
+            so_path = f"{directory}/circuit.so"
+            with open(c_path, "w") as handle:
+                handle.write(self.get_c_code())
+            result = subprocess.run(
+                ["gcc", f"-O{opt_level}", "-shared", "-fPIC", "-o", so_path, c_path],
+                capture_output=True, text=True,
+            )
+            if result.returncode:
+                raise RuntimeError(f"Native LUT6 C compilation failed:\n{result.stderr}")
+            library = ctypes.CDLL(so_path)
+            library.circuit.argtypes = [
+                np.ctypeslib.ndpointer(np.uint8, ndim=1, flags="C_CONTIGUOUS"),
+                np.ctypeslib.ndpointer(np.uint16, ndim=1, flags="C_CONTIGUOUS"),
+            ]
+            output = np.zeros((len(array), len(self.sums)), dtype=np.uint16)
+            for index, sample in enumerate(array):
+                library.circuit(np.ascontiguousarray(sample.reshape(-1)), output[index])
+        return output
+
+    def _verilog_signal(self, signal):
+        if signal.source == -1:
+            expression = "1'b0"
+        elif signal.source < self.n_inputs:
+            expression = f"inp[{signal.source}]"
+        else:
+            expression = f"n_{signal.source}"
+        return f"~({expression})" if signal.inverted else expression
+
+    @staticmethod
+    def _zero_extend(expression, source_width, target_width):
+        padding = target_width - source_width
+        if padding == 0:
+            return expression
+        if padding == 1:
+            return f"{{1'b0, {expression}}}"
+        return f"{{{{{padding}{{1'b0}}}}, {expression}}}"
+
+    def get_verilog_code(self):
+        lines = [
+            "// Auto-generated native-LUT6 combinational circuit",
+            "module circuit (",
+            f"    input wire [{self.n_inputs - 1}:0] inp,",
+            f"    output wire [{len(self.sums) * self.score_bits - 1}:0] scores_flat",
+            ");",
+            "",
+            "    function [7:0] popcount128;",
+            "        input [127:0] value;",
+            "        integer i;",
+            "        begin",
+            "            popcount128 = 8'd0;",
+            "            for (i = 0; i < 128; i = i + 1)",
+            "                popcount128 = popcount128 + value[i];",
+            "        end",
+            "    endfunction",
+            "",
+        ]
+        for gate in self.gates:
+            wire = f"n_{gate.gate_id}"
+            name = gate.name or f"u_lut6_{gate.gate_id}"
+            lines.append(f"    wire {wire};")
+            lines.append(f"    LUT6 #(.INIT(64'h{gate.init:016X})) {name} (")
+            ports = [f".I{pin}({self._verilog_signal(signal)})"
+                     for pin, signal in enumerate(gate.inputs)]
+            lines.append("        " + ", ".join(ports + [f".O({wire})"]) + ");")
+        lines.append("")
+        for class_index, reduction in enumerate(self.sums):
+            partials = []
+            for chunk_index, start in enumerate(range(0, len(reduction.signals), 128)):
+                chunk = reduction.signals[start:start + 128]
+                expressions = [self._verilog_signal(signal) for signal in reversed(chunk)]
+                if len(chunk) < 128:
+                    expressions.insert(0, f"{128 - len(chunk)}'b0")
+                bits = f"gs_{class_index}_bits_{chunk_index}"
+                partial = f"gs_{class_index}_p_{chunk_index}"
+                lines.append(f"    wire [127:0] {bits} = {{{', '.join(expressions)}}};")
+                lines.append(f"    wire [7:0] {partial} = popcount128({bits});")
+                partials.append((partial, 8))
+            level = 0
+            while len(partials) > 1:
+                combined = []
+                for pair in range(0, len(partials), 2):
+                    left, left_width = partials[pair]
+                    name = f"gs_{class_index}_l{level}_{pair // 2}"
+                    if pair + 1 < len(partials):
+                        right, right_width = partials[pair + 1]
+                        width = max(left_width, right_width) + 1
+                        left_value = self._zero_extend(left, left_width, width)
+                        right_value = self._zero_extend(right, right_width, width)
+                        lines.append(f"    wire [{width - 1}:0] {name} = {left_value} + {right_value};")
+                    else:
+                        width = left_width + 1
+                        lines.append(f"    wire [{width - 1}:0] {name} = {{1'b0, {left}}};")
+                    combined.append((name, width))
+                partials = combined
+                level += 1
+            if partials:
+                score, width = partials[0]
+                value = self._zero_extend(score, width, self.score_bits)
+                expression = f"{self.score_bits}'d{reduction.offset} + {value}"
+            else:
+                expression = f"{self.score_bits}'d{reduction.offset}"
+            lines.append(
+                f"    assign scores_flat[{class_index * self.score_bits} +: {self.score_bits}] = {expression};"
+            )
+            lines.append("")
+        lines.extend(["endmodule", ""])
+        return "\n".join(lines)

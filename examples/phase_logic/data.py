@@ -1,8 +1,10 @@
 """Deterministic dataset loading for paired phase-logic experiments."""
 
+from pathlib import Path
+
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import datasets, transforms
 
 from .config import ExperimentConfig
@@ -115,6 +117,38 @@ def _build_cifar100(
     )
 
 
+class HeartbeatDataset(Dataset):
+    """Five-class MIT-BIH beat split; 187 waveform samples plus one label."""
+
+    def __init__(self, path: Path, *, train: bool):
+        if not path.is_file():
+            raise FileNotFoundError(f"Heartbeat CSV not found: {path}")
+        raw = np.loadtxt(path, delimiter=",", dtype=np.float32)
+        if raw.ndim != 2 or raw.shape[1] != 188:
+            raise ValueError(f"Expected heartbeat CSV with 188 columns, got {raw.shape}.")
+        if not np.isfinite(raw).all():
+            raise ValueError(f"Heartbeat CSV contains non-finite values: {path}")
+        labels = raw[:, -1]
+        if np.any(labels != np.floor(labels)) or np.any((labels < 0) | (labels > 4)):
+            raise ValueError(f"Expected heartbeat class labels 0..4 in {path}.")
+        self.signals = torch.from_numpy(np.ascontiguousarray(raw[:, :187])).unsqueeze(1)
+        self.targets = torch.from_numpy(labels.astype(np.int64))
+        self.train = train
+
+    def __len__(self) -> int:
+        return len(self.targets)
+
+    def __getitem__(self, index: int):
+        return self.signals[index], self.targets[index]
+
+
+def _build_heartbeat(config: ExperimentConfig, *, train: bool, augment: bool = False):
+    if augment:
+        raise ValueError("CIFAR augmentation cannot be applied to heartbeat data.")
+    filename = "mitbih_train.csv" if train else "mitbih_test.csv"
+    return HeartbeatDataset(config.data_dir / "heartbeat" / filename, train=train)
+
+
 def compute_cifar10_quantile_thresholds(
     train_set,
     *,
@@ -162,6 +196,14 @@ def build_cifar10_input_thresholds(
 ) -> torch.Tensor | None:
     """Create the fixed thresholds used by the model's CIFAR encoder."""
 
+    if config.dataset == "heartbeat":
+        if not getattr(train_set, "train", False):
+            raise ValueError("Heartbeat quantile thresholds require the training split.")
+        signal = train_set.signals.numpy().reshape(-1)
+        # Use only the provided training split; retain thresholds in model state.
+        ranks = [len(signal) * bit // 3 for bit in (1, 2)]
+        selected = np.partition(signal, ranks)[ranks]
+        return torch.from_numpy(selected.copy())
     if config.dataset not in {"cifar10", "cifar100"}:
         return None
     if config.input_encoding == "fixed":
@@ -181,6 +223,7 @@ DATASET_BUILDERS = {
     "mnist": _build_mnist,
     "cifar10": _build_cifar10,
     "cifar100": _build_cifar100,
+    "heartbeat": _build_heartbeat,
 }
 
 
@@ -239,6 +282,60 @@ def build_data_loaders(
         pin_memory=pin_memory,
     )
     return train_loader, train_eval_loader, test_loader
+
+
+def build_progressive_infusion_loaders(
+    config: ExperimentConfig,
+) -> tuple[DataLoader, DataLoader, DataLoader, DataLoader, object]:
+    """Build train/train-eval/validation/test loaders with a fixed 10% holdout.
+
+    This opt-in split exists only for adaptive infusion decisions, avoiding test
+    data and augmented samples. The final item is the full training dataset used
+    to calculate fixed encoder thresholds exactly as in ordinary training.
+    """
+    try:
+        dataset_builder = DATASET_BUILDERS[config.dataset]
+    except KeyError as error:
+        raise ValueError(f"Unsupported dataset: {config.dataset!r}") from error
+    augmented_train = dataset_builder(
+        config, train=True, augment=config.cifar_augmentation,
+    )
+    evaluation_train = (
+        dataset_builder(config, train=True, augment=False)
+        if config.cifar_augmentation else augmented_train
+    )
+    test_set = dataset_builder(config, train=False, augment=False)
+    count = len(augmented_train)
+    validation_count = max(1, int(round(0.10 * count)))
+    if validation_count >= count:
+        raise ValueError("Progressive infusion validation split leaves no training examples.")
+    split_generator = torch.Generator().manual_seed(config.seed)
+    permutation = torch.randperm(count, generator=split_generator).tolist()
+    validation_indices = permutation[:validation_count]
+    training_indices = permutation[validation_count:]
+    train_set = Subset(augmented_train, training_indices)
+    train_eval_set = Subset(evaluation_train, training_indices)
+    validation_set = Subset(evaluation_train, validation_indices)
+    pin_memory = config.device.startswith("cuda")
+    train_loader = DataLoader(
+        train_set, batch_size=config.batch_size, shuffle=True,
+        generator=torch.Generator().manual_seed(config.seed),
+        num_workers=config.num_workers, pin_memory=pin_memory,
+        drop_last=config.uses_compact_logic,
+    )
+    train_eval_loader = DataLoader(
+        train_eval_set, batch_size=config.batch_size, shuffle=False,
+        num_workers=config.num_workers, pin_memory=pin_memory,
+    )
+    validation_loader = DataLoader(
+        validation_set, batch_size=config.batch_size, shuffle=False,
+        num_workers=config.num_workers, pin_memory=pin_memory,
+    )
+    test_loader = DataLoader(
+        test_set, batch_size=config.batch_size, shuffle=False,
+        num_workers=config.num_workers, pin_memory=pin_memory,
+    )
+    return train_loader, train_eval_loader, validation_loader, test_loader, evaluation_train
 
 
 def build_mnist_loaders(

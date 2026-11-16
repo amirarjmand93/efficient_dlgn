@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+vivado_build_*/
+reports_*/
+xsim.dir/
+*.jou
+*.log
+*.wdb
+*_sim/
+.DS_Store

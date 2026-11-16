@@ -17,6 +17,7 @@ MODEL_VARIANTS_BY_DATASET = {
     "mnist": (
         "build_model",
         "build_model_linear_head",
+        "build_model_mnist_small_compact",
     ),
     "cifar10": (
         "build_model_cifar10",
@@ -27,6 +28,8 @@ MODEL_VARIANTS_BY_DATASET = {
         "build_model_cifar10_small_modifieddense",
         "build_model_cifar10_small_classrouted",
         "build_model_cifar10_small_classrouted_compact_head",
+        "build_model_cifar10_small_compact",
+        "build_model_cifar10_small_compact_88000",
         "build_model_cifar10_small_compact_head",
         "build_model_cifar10_small_compact_head_wide75",
         "build_model_cifar10_small_mrlb_compact_head",
@@ -37,7 +40,9 @@ MODEL_VARIANTS_BY_DATASET = {
     "cifar100": (
         "build_model_cifar100_small_classrouted",
         "build_model_cifar100_small_classrouted_channelmixed",
+        "build_model_cifar100_small_compact",
     ),
+    "heartbeat": ("build_model_heartbeat_small_compact",),
 }
 MODEL_VARIANTS = tuple(
     model_name
@@ -48,8 +53,9 @@ DEFAULT_MODEL_VARIANT = {
     "mnist": "build_model",
     "cifar10": "build_model_cifar10",
     "cifar100": "build_model_cifar100_small_classrouted",
+    "heartbeat": "build_model_heartbeat_small_compact",
 }
-DATASETS = ("mnist", "cifar10", "cifar100")
+DATASETS = ("mnist", "cifar10", "cifar100", "heartbeat")
 INPUT_ENCODINGS = ("fixed", "quantile", "sinusoidal", "hybrid", "thermometer")
 INPUT_BIT_OPTIONS = (1, 2, 4)
 THERMOMETER_BIT_OPTIONS = (1, 2, 3, 4, 8)
@@ -109,6 +115,13 @@ class ExperimentConfig:
     compact_layer_aware_resampling: bool = False
     compact_efficient_layer_aware_resampling: bool = False
     compact_aggressive_layer_aware_resampling: bool = False
+    compact_progressive_aggressive_infusion: bool = False
+    compact_infusion_schedule: str = "aggressive"
+    compact_control_holdout: bool = False
+    compact_infusion_start_level: int = 1
+    compact_infusion_scope: str = "all"
+    compact_infusion_level_1_only: bool = False
+    compact_infusion_resume_checkpoint: Path | None = None
     compact_freeze_patience: int = 200
     compact_freeze_mode: str = "entropy"
     compact_freeze_min_interval: int = 5_000
@@ -136,6 +149,11 @@ class ExperimentConfig:
     @property
     def uses_classrouted_compact_head(self) -> bool:
         return self.model_variant in {
+            "build_model_mnist_small_compact",
+            "build_model_cifar10_small_compact",
+            "build_model_cifar10_small_compact_88000",
+            "build_model_cifar100_small_compact",
+            "build_model_heartbeat_small_compact",
             "build_model_cifar10_small_compact_head",
             "build_model_cifar10_small_compact_head_wide75",
             "build_model_cifar10_small_classrouted_compact_head",
@@ -163,7 +181,7 @@ class ExperimentConfig:
     @property
     def run_dir(self) -> Path:
         path = self.output_dir / self.dataset
-        if self.dataset in {"cifar10", "cifar100"}:
+        if self.dataset in {"cifar10", "cifar100", "heartbeat"}:
             path = path / self.input_encoding_slug
             if self.cifar_augmentation:
                 path = path / "crop_flip_augmentation"
@@ -189,6 +207,16 @@ class ExperimentConfig:
                 )
             if self.model_variant == "build_model_cifar10_small_compact_head":
                 topology = "compact_shared_head2_v2_concat_w92400x92400"
+            if self.model_variant == "build_model_cifar10_small_compact":
+                topology = "compact_shared_head2_v3_plain_w92400x92400"
+            if self.model_variant == "build_model_cifar10_small_compact_88000":
+                topology = "compact_shared_head2_v3_plain_w88000x88000"
+            if self.model_variant in {
+                "build_model_cifar100_small_compact",
+                "build_model_mnist_small_compact",
+                "build_model_heartbeat_small_compact",
+            }:
+                topology = "compact_shared_head2_v3_plain_w92400x92400"
             if self.model_variant == "build_model_cifar10_small_compact_head_wide75":
                 topology = "compact_shared_head2_wide75_v2_concat_c224x224x896x896_w161700x161700"
             path = path / (
@@ -202,6 +230,19 @@ class ExperimentConfig:
             path = path / "efficient_layer_aware_resampling_v2_conv25_dense1_u70_i18_n8_c4_dense2_u80_i12_n6_c2"
         if self.compact_aggressive_layer_aware_resampling:
             path = path / "aggressive_layer_aware_resampling_v1_conv25_d1_u50_i30_n5_c15_d2_u60_i25_n5_c10"
+        if self.compact_progressive_aggressive_infusion:
+            tag = "progressive_aggressive_infusion_v3_levels5_stable3_cooldown15000_rollback1p5_val10"
+            if self.compact_infusion_start_level != 1:
+                tag += f"_start{self.compact_infusion_start_level}"
+            if self.compact_infusion_schedule == "unary_biased":
+                tag += "_unary_biased"
+            if self.compact_infusion_scope != "all":
+                tag += f"_{self.compact_infusion_scope}_only"
+            if self.compact_infusion_level_1_only:
+                tag += "_level1_only"
+            path = path / tag
+        elif self.compact_control_holdout:
+            path = path / "compact_control_holdout_v1"
         if self.compact_freeze_mode == "none":
             path = path / "no_freeze_v1"
         if self.compact_freeze_mode == "hybrid":
@@ -245,6 +286,8 @@ class ExperimentConfig:
         if self.input_encoding in {"fixed", "quantile", "thermometer"}:
             return f"{self.input_encoding}_{self.quantile_bits}bit"
         if self.input_encoding == "hybrid" and self.hybrid_features == "lbp":
+            if self.dataset == "heartbeat":
+                return "hybrid_q2_local2"
             return "hybrid_q2_lbp2"
         sine_suffix = (
             f"sigma_{self.sine_sigma:g}_seed_{self.sine_seed}"
@@ -354,32 +397,53 @@ class ExperimentConfig:
         self._validate_compact()
 
     def _validate_compact(self) -> None:
-        if self.compact_aggressive_layer_aware_resampling:
-            if self.compact_layer_aware_resampling or self.compact_efficient_layer_aware_resampling:
-                raise ValueError("Choose only one layer-aware resampling strategy.")
-            if self.model_variant not in {
-                "build_model_cifar10_compact_small",
-                "build_model_cifar10_small_classrouted_compact_head",
-                "build_model_cifar10_small_compact_head",
-                "build_model_cifar10_small_compact_head_wide75",
-            }:
-                raise ValueError("--compact-aggressive-layer-aware-resampling requires a four-convolution, two-dense CompactLogic variant.")
-        if self.compact_efficient_layer_aware_resampling:
-            if self.compact_layer_aware_resampling:
-                raise ValueError("Choose only one layer-aware resampling strategy.")
-            if self.model_variant not in {
-                "build_model_cifar10_compact_small",
-                "build_model_cifar10_small_classrouted_compact_head",
-                "build_model_cifar10_small_compact_head",
-                "build_model_cifar10_small_compact_head_wide75",
-            }:
-                raise ValueError("--compact-efficient-layer-aware-resampling requires a four-convolution, two-dense CompactLogic variant.")
-        if self.compact_layer_aware_resampling and self.model_variant not in {
+        strategies = (
+            self.compact_layer_aware_resampling,
+            self.compact_efficient_layer_aware_resampling,
+            self.compact_aggressive_layer_aware_resampling,
+            self.compact_progressive_aggressive_infusion,
+        )
+        if sum(map(bool, strategies)) > 1:
+            raise ValueError("Choose only one layer-aware resampling strategy.")
+        if self.compact_control_holdout and not (
+            self.uses_compact_logic or self.uses_classrouted_compact_head
+        ):
+            raise ValueError("--compact-control-holdout requires a CompactLogic model.")
+        supported_four_conv = {
+            "build_model_mnist_small_compact",
             "build_model_cifar10_compact_small",
             "build_model_cifar10_small_classrouted_compact_head",
+            "build_model_cifar10_small_compact",
+            "build_model_cifar10_small_compact_88000",
+            "build_model_cifar100_small_compact",
+            "build_model_heartbeat_small_compact",
             "build_model_cifar10_small_compact_head",
             "build_model_cifar10_small_compact_head_wide75",
-        }:
+        }
+        if self.compact_progressive_aggressive_infusion:
+            if self.model_variant not in supported_four_conv:
+                raise ValueError("--compact-progressive-aggressive-infusion requires a four-convolution, two-dense CompactLogic variant.")
+            if self.compact_infusion_schedule not in {"aggressive", "unary_biased"}:
+                raise ValueError("compact_infusion_schedule must be aggressive or unary_biased.")
+            if self.compact_infusion_start_level not in range(1, 6):
+                raise ValueError("--compact-infusion-start-level must be between 1 and 5.")
+            if self.compact_infusion_scope not in {"all", "conv", "dense"}:
+                raise ValueError("--compact-infusion-scope must be all, conv, or dense.")
+            if (self.compact_infusion_scope == "conv" or self.compact_infusion_level_1_only) and self.compact_infusion_start_level != 1:
+                raise ValueError("Conv-only or Level-1-only infusion requires --compact-infusion-start-level 1.")
+        elif self.compact_infusion_scope != "all" or self.compact_infusion_level_1_only or self.compact_infusion_schedule != "aggressive":
+            raise ValueError("Infusion scope, schedule, and Level-1-only options require progressive infusion.")
+        elif self.compact_infusion_start_level != 1:
+            raise ValueError("--compact-infusion-start-level requires --compact-progressive-aggressive-infusion.")
+        elif self.compact_infusion_resume_checkpoint is not None:
+            raise ValueError("--compact-infusion-resume-checkpoint requires --compact-progressive-aggressive-infusion.")
+        if self.compact_aggressive_layer_aware_resampling:
+            if self.model_variant not in supported_four_conv:
+                raise ValueError("--compact-aggressive-layer-aware-resampling requires a four-convolution, two-dense CompactLogic variant.")
+        if self.compact_efficient_layer_aware_resampling:
+            if self.model_variant not in supported_four_conv:
+                raise ValueError("--compact-efficient-layer-aware-resampling requires a four-convolution, two-dense CompactLogic variant.")
+        if self.compact_layer_aware_resampling and self.model_variant not in supported_four_conv:
             raise ValueError("--compact-layer-aware-resampling requires a four-convolution, two-dense CompactLogic variant.")
         if self.model_variant == "build_model_cifar10_small_mrlb_compact_head":
             budget = self.mrlb_conv3_relational_channels
@@ -475,8 +539,8 @@ class ExperimentConfig:
         if self.hybrid_features not in {"sine", "lbp"}:
             raise ValueError("hybrid_features must be 'sine' or 'lbp'.")
         if self.hybrid_features == "lbp":
-            if self.dataset not in {"cifar10", "cifar100"} or self.input_encoding != "hybrid":
-                raise ValueError("LBP features require CIFAR with input_encoding='hybrid'.")
+            if self.dataset not in {"cifar10", "cifar100", "heartbeat"} or self.input_encoding != "hybrid":
+                raise ValueError("Local comparison features require CIFAR or heartbeat with input_encoding='hybrid'.")
             if self.quantile_bits != 2:
                 raise ValueError("Q2+LBP encoding requires exactly 2 quantile bits.")
             if self.num_sine_bits is not None:
@@ -511,6 +575,14 @@ class ExperimentConfig:
                     "num_input_bits=1."
                 )
             return
+        if self.dataset == "heartbeat":
+            if self.cifar_augmentation or self.cifar_random_erasing:
+                raise ValueError("CIFAR augmentation cannot be used with heartbeat data.")
+            if self.input_encoding != "hybrid" or self.hybrid_features != "lbp":
+                raise ValueError("Heartbeat requires --input-encoding hybrid --hybrid-features lbp.")
+            if self.quantile_bits != 2 or self.num_sine_bits is not None:
+                raise ValueError("Heartbeat requires Q2 plus two local comparison bits.")
+            return
         if self.cifar_random_erasing and not self.cifar_augmentation:
             raise ValueError(
                 "cifar_random_erasing requires cifar_augmentation so it is "
@@ -542,4 +614,8 @@ class ExperimentConfig:
         values = asdict(self)
         values["data_dir"] = str(self.data_dir)
         values["output_dir"] = str(self.output_dir)
+        values["compact_infusion_resume_checkpoint"] = (
+            str(self.compact_infusion_resume_checkpoint)
+            if self.compact_infusion_resume_checkpoint is not None else None
+        )
         return values

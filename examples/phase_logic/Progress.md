@@ -2,6 +2,51 @@
 
 The current DLGN has improved through several targeted changes while preserving its rank-2 Boolean/LUT structure and hardware-friendly design. The most successful improvements so far have been the **multi-bit input encoding**, especially quantile-based and hybrid Q+S representations, and **CIFAR random crop + horizontal-flip augmentation**, which produced a clear accuracy improvement. Class-routed dense layers were also explored, although their benefit appears smaller and less consistent.
 
+### Additional dataset support for the plain 92.4k CompactLogic model
+
+Added `build_model_cifar100_small_compact` and `build_model_mnist_small_compact`
+using the same 92,400-by-92,400 shared dense head and no-skip four-convolution
+backbone. CIFAR-100 uses the existing RGB Q2+LBP encoder and `GroupSum(k=100)`;
+MNIST uses the existing binarized grayscale 28x28 loader and `GroupSum(k=10)`.
+Both variants accept progressive aggressive infusion and hybrid convolution
+freezing controls. Commands are in `README.md`. These variants are registered
+but have not been trained, so no accuracy comparison is available.
+
+Example CIFAR-100 training command:
+
+```bash
+python -m examples.phase_logic.run_experiment \
+  --dataset cifar100 \
+  --model-variant build_model_cifar100_small_compact \
+  --input-encoding hybrid --hybrid-features lbp --num-quantile-bits 2 \
+  --cifar-augmentation \
+  --experiment pure_ce --parametrization compact --compact-backend cuda \
+  --compact-exploration-steps 800000 --iterations 1500000 \
+  --eval-frequency 15000 --learning-rate 0.02 --batch-size 128 \
+  --num-workers 4 --seed 4242449222 --device cuda --save-model \
+  --compact-progressive-aggressive-infusion --compact-freeze-mode hybrid \
+  --compact-freeze-max-taylor 0.2 \
+  --compact-freeze-max-loss-increase 0.099 \
+  --compact-freeze-max-probe-drift 1.0
+```
+
+Example MNIST training command for the matching compact topology:
+
+```bash
+python -m examples.phase_logic.run_experiment \
+  --dataset mnist \
+  --model-variant build_model_mnist_small_compact \
+  --input-encoding fixed --num-input-bits 1 \
+  --experiment pure_ce --parametrization compact --compact-backend cuda \
+  --compact-exploration-steps 800000 --iterations 1500000 \
+  --eval-frequency 15000 --learning-rate 0.02 --batch-size 128 \
+  --num-workers 4 --seed 4242449222 --device cuda --save-model \
+  --compact-progressive-aggressive-infusion --compact-freeze-mode hybrid \
+  --compact-freeze-max-taylor 0.2 \
+  --compact-freeze-max-loss-increase 0.099 \
+  --compact-freeze-max-probe-drift 1.0
+```
+
 The network still follows the same core pipeline:
 
 **binary encoder → LogicConv layers → LogicDense/class-routed layers → GroupSum classification**
@@ -35,10 +80,23 @@ The highest-priority areas are therefore:
 
 The most promising current direction is therefore not simply making the DLGN wider or deeper, but improving **how information is connected and composed inside the existing logic gates** while keeping the final network compact and hardware-friendly.
 
-# Model Variants:
+# Model Cifar10 Variants:
   --model-variant build_model_cifar10_small_classrouted_compact_head
+  --model-variant build_model_cifar10_small_compact [no skip connection-92.4k x 92.4k]
   --model-variant build_model_cifar10_small_compact_head
+  --model-variant build_model_cifar10_compact_small [no skip connection-80*80 orginal size]
   --model-variant build_model_cifar10_small_compact_head_wide75
+
+  # Skip-connection ablation [adopted]
+  The plain `build_model_cifar10_small_compact` run with 92,400 x 92,400 dense
+  layers and no concatenation skip connections reached 70.72% peak discrete
+  test accuracy. This is comparable to the skip-connected model, so removing
+  the skip connection did not reduce accuracy in this experiment. We no longer
+  use skip connections in the selected architecture; this also avoids their
+  additional long-range routing connections.
+
+  Evidence:
+  `results/cifar10/hybrid_q2_lbp2/crop_flip_augmentation/compact_shared_head2_v3_plain_w92400x92400_cuda_c16_explore800000_resample100_freeze200`
 
 python -m pip install --no-build-isolation '.[compact]'
 
@@ -90,13 +148,13 @@ python -m examples.phase_logic.run_experiment \
 
   --compact-freeze-max-probe-drift 1.0
 
-  # Best CLI
+  # Best CLI - no skip-connection
   # new flag for Quantile + Binary Spatial Direction Encoding (BSDE):
   --input-encoding hybrid --hybrid-features lbp --num-quantile-bits 2
 
   python -m examples.phase_logic.run_experiment \
   --dataset cifar10 \
-  --model-variant build_model_cifar10_small_compact_head \
+  --model-variant build_model_cifar10_small_compact \
   --input-encoding hybrid --hybrid-features lbp --num-quantile-bits 2 \
   --cifar-augmentation \
   --experiment pure_ce --parametrization compact --compact-backend cuda \
@@ -163,6 +221,49 @@ python -m examples.phase_logic.run_experiment \
     | Dense1 | 50% | 30% | 5% | 15% |
     | Dense2 | 60% | 25% | 5% | 10% |
 
+    
+
+    --compact-progressive-aggressive-infusion
+      5 level
+      Changed the Progressive Aggressive Infusion defaults:
+    - Rollback accuracy drop: 1.5 pp (0.015)
+    - Rollback loss increase: 0.10
+    - Stable accuracy tolerance: 0.3 pp (0.003)
+    - Stable loss tolerance remains 0.05
+    - Cooldown remains 15,000 steps
+    - Stability requirement remains 3 evaluations
+
+    Result [accuracy regression / not selected]:
+    The controller reached Level 5 at step 525,000, where candidate infusion
+    strongly preferred identity and constant gates. The run achieved 69.38%
+    peak discrete test accuracy and finished at 69.19%, below the 70.72% result
+    recorded for the selected plain no-skip model. This experiment indicates
+    that progressively increasing identity/TRUE/FALSE pressure reduced model
+    accuracy. We therefore do not use progressive aggressive infusion in the
+    selected accuracy-oriented configuration. The comparison is directional,
+    since the two runs also differ in backbone/skip configuration, seed, and
+    exploration length.
+
+    Evidence:
+    `results/cifar10/hybrid_q2_lbp2/crop_flip_augmentation/compact_shared_head2_v2_concat_w92400x92400_cuda_c16_explore700000_resample100_freeze200/progressive_aggressive_infusion_v3_levels5_stable3_cooldown15000_rollback1p5_val10`
+
+    --compact-progressive-aggressive-infusion-unary-biased [new, untested]
+    Alternative five-level dense candidate schedule; use this flag instead of
+    `--compact-progressive-aggressive-infusion`. Constant preference stays at
+    15%, while identity and inversion preferences rise across levels. Conv1–3
+    keep the existing 25% AND/OR preference, with the same validation-based
+    advancement and rollback rules.
+
+    | Level | Uniform | Identity A/B | NOT A/B | TRUE/FALSE |
+    |---|---:|---:|---:|---:|
+    | 1 | 50% | 30% | 5% | 15% |
+    | 2 | 45% | 30% | 10% | 15% |
+    | 3 | 40% | 35% | 10% | 15% |
+    | 4 | 35% | 35% | 15% | 15% |
+    | 5 | 30% | 40% | 15% | 15% |
+
+
+
   # my ablation study :
     My preferred figure
     Plot the normalized gradient variance for Dense1 and Dense2, comparing:
@@ -179,4 +280,4 @@ python -m examples.phase_logic.run_experiment \
 
     // run artix7 test
    vivado -mode batch -source synthesize.tcl \
-   -tclargs ../circuit.v xc7a35tcpg236-1 artix_reports 10.0  
+   -tclargs ../circuit.v xc7a35tcpg236-1 artix_reports 10.0

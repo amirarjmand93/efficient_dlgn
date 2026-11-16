@@ -66,6 +66,7 @@ MNIST builders:
 
 - `build_model`
 - `build_model_linear_head`
+- `build_model_mnist_small_compact`
 
 CIFAR-10 builders:
 
@@ -76,6 +77,8 @@ CIFAR-10 builders:
 - `build_model_cifar10_small_modifieddense`
 - `build_model_cifar10_small_classrouted`
 - `build_model_cifar10_small_classrouted_compact_head`
+- `build_model_cifar10_small_compact`
+- `build_model_cifar10_small_compact_88000`
 - `build_model_cifar10_small_compact_head`
 - `build_model_cifar10_small_mrlb_compact_head`
 - `build_model_cifar10_small_classrouted_channelmixed`
@@ -86,6 +89,7 @@ CIFAR-100 builders:
 
 - `build_model_cifar100_small_classrouted`
 - `build_model_cifar100_small_classrouted_channelmixed`
+- `build_model_cifar100_small_compact`
 
 The `channelmixed` variants are opt-in ablations. They apply
 `channel-balanced` connectivity only to the first LogicConv layer; later
@@ -139,7 +143,8 @@ remain uniform. This applies only to replacement candidates during exploration;
 initialization, strong winners, input-pair routing, Adam resets, and freezing
 are unchanged. All 16 operations remain possible. Supported variants are
 `build_model_cifar10_compact_small`,
-`build_model_cifar10_small_classrouted_compact_head`, and
+`build_model_cifar10_small_classrouted_compact_head`,
+`build_model_cifar10_small_compact`, and
 `build_model_cifar10_small_compact_head`, with either backend and either conv
 freezing mode. No added parameters or inference gates. Runs use the separate
 `layer_aware_resampling_v1_preferred25` results subdirectory; omit the flag to
@@ -276,6 +281,87 @@ topology, even when parameter counts match.
 Results include `compact.csv` and optional best/final checkpoints. The original
 CIFAR builders and `build_model_cifar10_compact_small` remain unchanged.
 Accuracy improvements are unmeasured.
+
+### No-skip small model with 92.4k dense stages
+
+`build_model_cifar10_small_compact` is the width-matched no-skip counterpart to
+`build_model_cifar10_small_compact_head`. It keeps convolution widths
+`128,128,512,512`, dense widths `92400,92400`, and `GroupSum(k=10, tau=55)`, but
+uses a plain sequential backbone:
+
+```text
+encoder -> Conv1 -> Conv2 -> Conv3 -> Conv4
+        -> flatten 32768 -> Dense1 92400 -> Dense2 92400 -> GroupSum
+```
+
+Conv3 receives only Conv2 rather than `concat(Conv1, Conv2)`, and Dense1 receives
+only Conv4 rather than `concat(Conv3, Conv4)`. It has the same **2,977,280**
+training parameters and **315,872** unpruned Boolean node applications as the
+92.4k skip model; only the input pools/topology differ. It supports the original,
+efficient, or aggressive layer-aware resampling modes and entropy, hybrid, or
+disabled convolution freezing. Results use the separate
+`compact_shared_head2_v3_plain_w92400x92400_.../` directory. Select it with:
+
+```bash
+--model-variant build_model_cifar10_small_compact
+```
+
+Use a fresh training run; skip-connected checkpoints are topology-incompatible.
+
+`build_model_cifar10_small_compact_88000` keeps this same no-skip encoder and
+four-convolution backbone, but uses `88000 -> 88000` dense stages. It has
+2,836,480 training parameters and a separate
+`compact_shared_head2_v3_plain_w88000x88000_.../` results path. It supports
+the same progressive aggressive infusion and hybrid freezing flags; its
+checkpoints are shape-incompatible with the 92.4k variant.
+
+### Same plain shared-head model on CIFAR-100 and MNIST
+
+`build_model_cifar100_small_compact` reuses the 32x32 RGB Q2+LBP encoder and
+`128,128,512,512` no-skip convolution stack, with two shared 92,400-output
+dense layers and `GroupSum(k=100, tau=55)`. Each class receives 924 score
+nodes. CIFAR-100 uses the existing RGB data and crop/flip path.
+
+```bash
+python -m examples.phase_logic.run_experiment \
+  --dataset cifar100 \
+  --model-variant build_model_cifar100_small_compact \
+  --input-encoding hybrid --hybrid-features lbp --num-quantile-bits 2 \
+  --cifar-augmentation \
+  --experiment pure_ce --parametrization compact --compact-backend cuda \
+  --compact-exploration-steps 800000 --iterations 1500000 \
+  --eval-frequency 15000 --learning-rate 0.02 --batch-size 128 \
+  --num-workers 4 --seed 4242449222 --device cuda --save-model \
+  --compact-progressive-aggressive-infusion --compact-freeze-mode hybrid \
+  --compact-freeze-max-taylor 0.2 \
+  --compact-freeze-max-loss-increase 0.099 \
+  --compact-freeze-max-probe-drift 1.0
+```
+
+`build_model_mnist_small_compact` uses MNIST's already-binarized grayscale
+`1x28x28` input, with the same convolution widths and two 92,400-output dense
+layers. The last convolution yields 25,088 inputs to Dense1;
+`GroupSum(k=10, tau=55)` is unchanged. MNIST already has a data loader, so this
+is a new model variant, not a new dataset loader. Q2+LBP and CIFAR augmentation
+do not apply.
+
+```bash
+python -m examples.phase_logic.run_experiment \
+  --dataset mnist \
+  --model-variant build_model_mnist_small_compact \
+  --input-encoding fixed --num-input-bits 1 \
+  --experiment pure_ce --parametrization compact --compact-backend cuda \
+  --compact-exploration-steps 800000 --iterations 1500000 \
+  --eval-frequency 15000 --learning-rate 0.02 --batch-size 128 \
+  --num-workers 4 --seed 4242449222 --device cuda --save-model \
+  --compact-progressive-aggressive-infusion --compact-freeze-mode hybrid \
+  --compact-freeze-max-taylor 0.2 \
+  --compact-freeze-max-loss-increase 0.099 \
+  --compact-freeze-max-probe-drift 1.0
+```
+
+These are new topologies without training results yet. Their output folders
+are dataset-specific; use fresh checkpoints for each variant.
 
 ### Small shared head with two 5%-wider dense stages
 
@@ -951,6 +1037,24 @@ mode and replace only the model name with
 `build_model_cifar10_small_classrouted_compact_head`. Use fresh runs and a validation
 split for tuning before final test-set comparison; accuracy improvements are not
 established by construction tests.
+
+### Progressive aggressive infusion
+
+Add `--compact-progressive-aggressive-infusion` to a supported four-convolution,
+two-dense CompactLogic run. It starts with the 50/30/5/15% candidate mixture and
+uses discrete metrics on a fixed 10% training holdout to progress through five
+levels, ending at 70% TRUE/FALSE candidates. Every increase is preceded by a
+safe checkpoint, and significant validation regression restores that checkpoint.
+Do not combine this flag with another layer-aware resampling flag.
+Level increases have a 15,000-step cooldown, and a 1.5 percentage-point drop
+from the current safe accuracy triggers rollback, while future increases must
+remain acceptable relative to the best safe accuracy seen so far.
+
+To resume, add `--compact-infusion-resume-checkpoint path/to/checkpoint.pt`.
+To start a new run directly at Level 2 or 3, add
+`--compact-infusion-start-level 2` or `--compact-infusion-start-level 3`.
+Implementation details and the reusable Python API are documented in
+[`infusion_training/README.md`](infusion_training/README.md).
 
 ### CIFAR-100
 

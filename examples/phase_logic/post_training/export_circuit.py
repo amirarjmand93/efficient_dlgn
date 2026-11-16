@@ -18,6 +18,7 @@ from torchlogix.circuit import Circuit, Gate, GateOp, LUT_ID_TO_GATE, SumReducti
 from torchlogix.layers import GroupSum
 
 from ..compact import CandidateLogicLayer, UniformThermometerEncoder
+from ..heartbeat import HeartbeatQ2LocalEncoder
 from ..model import HybridFeatureEncoder
 from .load_checkpoint import ArchitectureTracer, load_checkpoint
 
@@ -62,13 +63,20 @@ def compact_to_circuit(model, *, input_shape=None):
         raise ValueError("Export requires model.eval(); relaxed mixtures cannot be exported as Boolean gates.")
     modules = dict(model.named_modules())
     encoders = [module for module in modules.values()
-                if isinstance(module, (HybridFeatureEncoder, UniformThermometerEncoder))]
+                if isinstance(module, (HybridFeatureEncoder, UniformThermometerEncoder,
+                                       HeartbeatQ2LocalEncoder))]
+    if not encoders and isinstance(model[0], torch.nn.Identity):
+        encoders = [model[0]]  # MNIST data pipeline already supplies binary images.
     if len(encoders) != 1:
         raise ValueError("Expected exactly one input encoder.")
     if input_shape is None:
-        input_shape = (encoders[0].output_channels, 32, 32)
+        input_shape = ((1, 28, 28) if isinstance(encoders[0], torch.nn.Identity)
+                       else (encoders[0].output_channels, 11, 17)
+                       if isinstance(encoders[0], HeartbeatQ2LocalEncoder)
+                       else (encoders[0].output_channels, 32, 32))
     input_shape = tuple(input_shape)
-    if len(input_shape) != 3 or input_shape[0] != encoders[0].output_channels or min(input_shape) <= 0:
+    expected_channels = 1 if isinstance(encoders[0], torch.nn.Identity) else encoders[0].output_channels
+    if len(input_shape) != 3 or input_shape[0] != expected_channels or min(input_shape) <= 0:
         raise ValueError("input_shape must be encoded (channels,height,width), matching the encoder.")
     circuit = Circuit(n_inputs=math.prod(input_shape), input_shape=list(input_shape))
     graph = ArchitectureTracer().trace(model)
@@ -109,7 +117,10 @@ def compact_to_circuit(model, *, input_shape=None):
         elif node.op == "call_module":
             module = modules[node.target]
             source = wires[node.args[0]]
-            if isinstance(module, (HybridFeatureEncoder, UniformThermometerEncoder)):
+            if isinstance(module, (HybridFeatureEncoder, UniformThermometerEncoder,
+                                   HeartbeatQ2LocalEncoder)) or (
+                isinstance(module, torch.nn.Identity) and node.target == "0"
+            ):
                 if node.args[0].op != "placeholder":
                     raise ValueError("Encoder must consume the raw model input directly.")
                 wires[node] = source  # External preprocessing already produced these bits.
@@ -179,18 +190,25 @@ def compact_to_circuit(model, *, input_shape=None):
 
 
 def verification_data(model, *, samples=4, seed=0):
-    """Generate encoded inputs and exact reference counts from full RGB inference."""
+    """Generate encoded inputs and exact reference counts from image inference."""
     if samples < 1:
         raise ValueError("At least one verification sample is required.")
     generator = torch.Generator().manual_seed(seed)
-    rgb = torch.rand(samples, 3, 32, 32, generator=generator)
+    mnist = isinstance(model[0], torch.nn.Identity)
+    heartbeat = isinstance(model[0], HeartbeatQ2LocalEncoder)
+    image_shape = ((1, 28, 28) if mnist else (1, 187) if heartbeat else (3, 32, 32))
+    images = torch.rand(samples, *image_shape, generator=generator)
+    if mnist:
+        images = (images >= 0.5).float()  # Match the binary MNIST data pipeline.
     if samples >= 2:
-        rgb[0].zero_()
-        rgb[1].fill_(1)
+        images[0].zero_()
+        images[1].fill_(1)
     device = next(model.parameters()).device
-    rgb = rgb.to(device)
-    encoder = next(module for module in model.modules()
-                   if isinstance(module, (HybridFeatureEncoder, UniformThermometerEncoder)))
+    images = images.to(device)
+    encoder = model[0]
+    if not isinstance(encoder, (HybridFeatureEncoder, UniformThermometerEncoder,
+                                HeartbeatQ2LocalEncoder, torch.nn.Identity)):
+        raise ValueError("Unsupported input encoder.")
     groups = [module for module in model.modules() if isinstance(module, GroupSum)]
     if len(groups) != 1:
         raise ValueError("Expected one final GroupSum.")
@@ -206,8 +224,8 @@ def verification_data(model, *, samples=4, seed=0):
     hook = group_sum.register_forward_pre_hook(capture)
     try:
         with torch.inference_mode():
-            encoded = encoder(rgb).cpu().bool().numpy()
-            logits = model(rgb).cpu()
+            encoded = encoder(images).cpu().bool().numpy()
+            logits = model(images).cpu()
     finally:
         hook.remove()
     if len(captured) != 1:
@@ -283,7 +301,7 @@ def export_checkpoint(checkpoint, output_dir, *, config_path=None, verify_sample
                                             ("input_encoding", "hybrid_features", "num_input_bits",
                                              "num_quantile_bits", "num_sine_bits", "sine_sigma", "sine_seed")},
                   "encoder_state": encoder_state,
-                  "channel_order": encoder.channel_order,
+                  "channel_order": getattr(encoder, "channel_order", "grayscale"),
                   "lbp": {"radius": 1, "padding": "replicate", "comparisons":
                           ["right >= left", "down >= up"]} if getattr(encoder, "num_lbp_bits", 0) else None},
         "output": {"kind": "raw integer class counts", "shape": circuit.output_shape,

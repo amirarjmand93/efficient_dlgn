@@ -1,0 +1,6 @@
+after having .pt file, we need new script to export all .pt files to lut6 json in 
+"examples/phase_logic/New_post_training/outputs"
+after that we need coomand for bridge them (lut6) to sv folders in 
+the path lut.json files exist. 
+
+python -m examples.phase_logic.ablation_control_expriments.infusion_control.run_all --iterations 500000 --exploration-steps 300000 --eval-frequency 50000

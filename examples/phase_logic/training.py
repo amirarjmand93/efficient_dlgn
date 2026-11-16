@@ -17,7 +17,15 @@ from .dense_freezing import DENSE_FREEZE_FIELDS, DenseFreezeController, enable_d
 from .data import (
     build_cifar10_input_thresholds,
     build_data_loaders,
+    build_progressive_infusion_loaders,
     repeat_loader,
+)
+from .infusion_training import (
+    infusion_levels,
+    INFUSION_TRANSITION_FIELDS,
+    ProgressiveAggressiveInfusion,
+    load_infusion_checkpoint,
+    save_infusion_checkpoint,
 )
 from .losses import PhaseLogicLoss, margin_phase_statistics
 from .model import (
@@ -25,6 +33,7 @@ from .model import (
     build_model_for_dataset,
     logic_layer_width_report,
 )
+from .heartbeat import HeartbeatQ2LocalEncoder
 from .rewiring import LossProbedRewirer, REWIRING_FIELDS
 from .schedules import (
     cosine_decay,
@@ -44,6 +53,8 @@ METRIC_FIELDS = [
     "train_phase",
     "train_loss_relaxed",
     "train_acc_relaxed",
+    "validation_loss_discrete",
+    "validation_acc_discrete",
     "test_loss_discrete",
     "test_acc_discrete",
     "test_loss_relaxed",
@@ -161,6 +172,13 @@ def _write_json(path: Path, value: dict[str, Any]) -> None:
         handle.write("\n")
 
 
+def _initialize_csv(path: Path, fields, *, resume: bool) -> None:
+    if resume and path.is_file() and path.stat().st_size:
+        return
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        csv.writer(handle).writerow(fields)
+
+
 def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
     """Train one arm and return its final reproducible summary."""
 
@@ -169,16 +187,23 @@ def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
     device = resolve_device(config.device)
     run_dir = config.run_dir
     run_dir.mkdir(parents=True, exist_ok=True)
+    resuming_infusion = config.compact_infusion_resume_checkpoint is not None
 
     _write_json(
         run_dir / "config.json",
         {**config.to_dict(), "resolved_device": str(device)},
     )
 
-    train_loader, train_eval_loader, test_loader = build_data_loaders(config)
+    validation_loader = None
+    if config.compact_progressive_aggressive_infusion or config.compact_control_holdout:
+        (train_loader, train_eval_loader, validation_loader, test_loader,
+         threshold_dataset) = build_progressive_infusion_loaders(config)
+    else:
+        train_loader, train_eval_loader, test_loader = build_data_loaders(config)
+        threshold_dataset = train_loader.dataset
     input_thresholds = build_cifar10_input_thresholds(
         config,
-        train_loader.dataset,
+        threshold_dataset,
     )
     model = build_model_for_dataset(
         device,
@@ -200,11 +225,11 @@ def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
     parameter_count = sum(p.numel() for p in model.parameters())
     layer_widths = logic_layer_width_report(model)
     encoding_report = None
-    if config.dataset in {"cifar10", "cifar100"}:
+    if config.dataset in {"cifar10", "cifar100", "heartbeat"}:
         encoder = next(
             module
             for module in model.modules()
-            if isinstance(module, (HybridFeatureEncoder, UniformThermometerEncoder))
+            if isinstance(module, (HybridFeatureEncoder, UniformThermometerEncoder, HeartbeatQ2LocalEncoder))
         )
         sample_input = train_loader.dataset[0][0].unsqueeze(0).to(device)
         with torch.no_grad():
@@ -215,7 +240,8 @@ def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
             "num_quantile_bits": encoder.num_quantile_bits,
             "num_sine_bits": encoder.num_sine_bits,
             "thresholds": (
-                encoder.thresholds.detach().cpu().tolist()
+                (encoder.thresholds.detach().cpu().tolist()
+                 if config.dataset != "heartbeat" else [encoder.thresholds.detach().cpu().tolist()])
                 if encoder.num_quantile_bits or config.input_encoding == "thermometer"
                 else None
             ),
@@ -239,7 +265,10 @@ def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
             encoding_report.update({
                 "hybrid_features": "lbp",
                 "num_lbp_bits": encoder.num_lbp_bits,
-                "lbp_comparisons": ["right >= left", "down >= up"],
+                "lbp_comparisons": (
+                    ["center > left sample", "center > right sample"]
+                    if config.dataset == "heartbeat" else ["right >= left", "down >= up"]
+                ),
                 "lbp_radius": 1,
                 "lbp_padding": "replicate",
             })
@@ -264,9 +293,19 @@ def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
         heads = [layer for layer in model if isinstance(layer, CandidateLogicLayer) and not layer.is_convolution]
         model_report["compact"] = {
             "backend": heads[0].backend,
-            "scope": ("CompactLogic plain six-convolution backbone and fully shared dense head"
-                      if config.model_variant == "build_model_cifar10_compact_sixconv"
-                      else "CompactLogic channel-concatenation skips and fully shared dense head"),
+            "scope": (
+                "CompactLogic plain six-convolution backbone and fully shared dense head"
+                if config.model_variant == "build_model_cifar10_compact_sixconv"
+                else "CompactLogic plain four-convolution backbone and fully shared dense head"
+                if config.model_variant in {
+                    "build_model_cifar10_small_compact",
+                    "build_model_cifar10_small_compact_88000",
+                    "build_model_cifar100_small_compact",
+                    "build_model_mnist_small_compact",
+                    "build_model_heartbeat_small_compact",
+                }
+                else "CompactLogic channel-concatenation skips and fully shared dense head"
+            ),
             "dense_connectivity": ["full shared input"] * len(heads),
             "concatenation_skips": list(getattr(model, "concatenation_skips", ())),
             "candidate_count": 16,
@@ -319,6 +358,35 @@ def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
                        "identity_ops": [3, 5], "not_fraction": 0.05, "not_ops": [12, 10],
                        "constant_fraction": 0.10, "constant_ops": [15, 0]},
         }
+    if config.compact_progressive_aggressive_infusion:
+        model_report["compact"]["candidate_resampling"] = {
+            "mode": (
+                "progressive_unary_biased_infusion_v1"
+                if config.compact_infusion_schedule == "unary_biased"
+                else "progressive_aggressive_infusion_v1"
+            ),
+            "start_level": config.compact_infusion_start_level,
+            "schedule": config.compact_infusion_schedule,
+            "scope": config.compact_infusion_scope,
+            "level_1_only": config.compact_infusion_level_1_only,
+            "validation_fraction": 0.10,
+            "stable_evaluations_to_advance": 3,
+            "minimum_transition_steps": 15_000,
+            "stable_accuracy_tolerance": 0.003,
+            "rollback_accuracy_drop": 0.015,
+            "rollback_loss_increase": 0.10,
+            "accuracy_reference": "best_safe_checkpoint",
+            "levels": [
+                {
+                    "level": level.level, "name": level.name,
+                    "uniform_fraction": level.uniform,
+                    "identity_fraction": level.identity,
+                    "not_fraction": level.inversion,
+                    "constant_fraction": level.constant,
+                }
+                for level in infusion_levels(config.compact_infusion_schedule)
+            ],
+        }
     _write_json(run_dir / "model_report.json", model_report)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
     dense_freezer = DenseFreezeController(model, config, optimizer) if config.compact_dense_freeze else None
@@ -329,28 +397,67 @@ def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
             "after_all_convs": True, "taylor_required": False,
         }
         _write_json(run_dir / "model_report.json", model_report)
-        with (run_dir / "dense_freeze_probes.csv").open("w", newline="", encoding="utf-8") as handle:
-            csv.DictWriter(handle, fieldnames=DENSE_FREEZE_FIELDS).writeheader()
+        _initialize_csv(run_dir / "dense_freeze_probes.csv", DENSE_FREEZE_FIELDS,
+                        resume=resuming_infusion)
     controller_type = HybridFreezeController if config.compact_freeze_mode == "hybrid" else CompactLogicController
     compact_controller = (
         controller_type(model, config)
         if config.uses_compact_logic or config.uses_classrouted_compact_head else None
     )
+    infusion_controller = (
+        ProgressiveAggressiveInfusion(
+            model, exploration_steps=config.compact_exploration_steps,
+            start_level=config.compact_infusion_start_level,
+            scope=config.compact_infusion_scope,
+            schedule=config.compact_infusion_schedule,
+            level_1_only=config.compact_infusion_level_1_only,
+        )
+        if config.compact_progressive_aggressive_infusion else None
+    )
+    infusion_safe_path = run_dir / "progressive_infusion_safe.pt"
+    infusion_log_path = run_dir / "progressive_infusion_transitions.csv"
     freeze_probe_batches = None
     if isinstance(compact_controller, HybridFreezeController):
         freeze_probe_batches = repeat_loader(train_eval_loader)
-        with (run_dir / "freeze_probes.csv").open("w", newline="", encoding="utf-8") as handle:
-            csv.DictWriter(handle, fieldnames=FREEZE_PROBE_FIELDS).writeheader()
+        _initialize_csv(run_dir / "freeze_probes.csv", FREEZE_PROBE_FIELDS,
+                        resume=resuming_infusion)
     if compact_controller is not None:
-        with (run_dir / "compact.csv").open("w", newline="", encoding="utf-8") as handle:
-            csv.writer(handle).writerow([
-                "step", "weak_rows_resampled", "strong_rows_refreshed", "frozen_conv_layers",
-            ])
+        _initialize_csv(
+            run_dir / "compact.csv",
+            ("step", "weak_rows_resampled", "strong_rows_refreshed", "frozen_conv_layers"),
+            resume=resuming_infusion,
+        )
     rewirer = LossProbedRewirer(model, config) if config.rewire_loss_probe else None
     probe_batches = repeat_loader(train_eval_loader) if rewirer is not None else None
     if rewirer is not None:
-        with (run_dir / "rewiring.csv").open("w", newline="", encoding="utf-8") as handle:
-            csv.DictWriter(handle, fieldnames=REWIRING_FIELDS).writeheader()
+        _initialize_csv(run_dir / "rewiring.csv", REWIRING_FIELDS,
+                        resume=resuming_infusion)
+    resume_state = None
+    start_step = 1
+    if infusion_controller is not None:
+        _initialize_csv(infusion_log_path, INFUSION_TRANSITION_FIELDS,
+                        resume=resuming_infusion)
+        if resuming_infusion:
+            resume_state = load_infusion_checkpoint(
+                config.compact_infusion_resume_checkpoint,
+                model=model, optimizer=optimizer,
+                compact_controller=compact_controller,
+                infusion_controller=infusion_controller,
+                dense_freezer=dense_freezer, map_location="cpu",
+            )
+            start_step = int(resume_state["step"]) + 1
+            with infusion_log_path.open("a", newline="", encoding="utf-8") as handle:
+                csv.DictWriter(handle, fieldnames=INFUSION_TRANSITION_FIELDS).writerow({
+                    "step": resume_state["step"], "event": "resume",
+                    "from_level": infusion_controller.level,
+                    "to_level": infusion_controller.level,
+                    "validation_accuracy": resume_state.get("metrics", {}).get("validation_acc_discrete"),
+                    "validation_loss": resume_state.get("metrics", {}).get("validation_loss_discrete"),
+                    "safe_accuracy": infusion_controller.safe_accuracy,
+                    "safe_loss": infusion_controller.safe_loss,
+                    "reason": "resumed training checkpoint",
+                    "checkpoint": str(config.compact_infusion_resume_checkpoint),
+                })
     criterion = PhaseLogicLoss(
         config.loss_option,
         margin=config.phase_margin,
@@ -372,7 +479,7 @@ def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
             + (f"lbp_bits={config.lbp_bits} " if config.lbp_bits else "")
             + f"total_bits={encoding_report['num_bits']}"
         )
-        channel_names = ("R", "G", "B")
+        channel_names = ("waveform",) if config.dataset == "heartbeat" else ("R", "G", "B")
         if encoding_report["thresholds"] is not None:
             formatted_thresholds = " ".join(
                 f"{channel}=["
@@ -452,6 +559,32 @@ def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
             print("  candidate_resampling=ELAR_v2 Conv1-3=75%uniform+25%AND/OR Conv4=uniform Dense1=70%uniform+18%identity+8%NOT+4%constants Dense2=80%uniform+12%identity+6%NOT+2%constants")
         if config.compact_aggressive_layer_aware_resampling:
             print("  candidate_resampling=aggressive_layer_aware_v1 Conv1-3=75%uniform+25%AND/OR Conv4=uniform Dense1=50%uniform+30%identity+5%NOT+15%constants Dense2=60%uniform+25%identity+5%NOT+10%constants")
+        if infusion_controller is not None:
+            policy = infusion_controller.policy
+            scope_note = (
+                f"scope={infusion_controller.scope} "
+                if infusion_controller.scope != "all" else ""
+            )
+            schedule_note = (
+                "schedule=unary_biased "
+                if infusion_controller.schedule == "unary_biased" else ""
+            )
+            dense_note = (
+                "dense=uniform " if infusion_controller.scope == "conv" else
+                f"uniform={policy.uniform:.0%} identity={policy.identity:.0%} "
+                f"NOT={policy.inversion:.0%} constants={policy.constant:.0%} "
+            )
+            advance_note = (
+                "advance=off "
+                if infusion_controller.scope == "conv" or infusion_controller.level_1_only else
+                "advance_after=3_validation_evaluations cooldown=15000_steps "
+            )
+            print(
+                "  candidate_resampling=progressive_aggressive_infusion "
+                f"level={policy.level}:{policy.name} "
+                + schedule_note + scope_note + dense_note + advance_note +
+                "rollback_accuracy_drop=1.5pp rollback_loss_increase=0.10"
+            )
     if dense_freezer is not None:
         print(f"  dense_freezing=groups fraction={config.dense_freeze_fraction:g} after_all_convs=True "
               f"recovery_steps={config.dense_freeze_min_interval} "
@@ -459,8 +592,11 @@ def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
               f"max_loss_increase={config.dense_freeze_max_loss_increase:g}")
 
     metrics_path = run_dir / "metrics.csv"
-    best_discrete_accuracy = 0.0
-    best_compact_step = None
+    best_discrete_accuracy = (
+        float(resume_state.get("metrics", {}).get("test_acc_discrete", 0.0))
+        if resume_state is not None else 0.0
+    )
+    best_compact_step = int(resume_state["step"]) if resume_state is not None else None
     final_metrics: dict[str, Any] = {}
     running_examples = 0
     running_total = 0.0
@@ -468,11 +604,13 @@ def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
     running_phase = 0.0
 
     training_started = time.perf_counter()
-    with metrics_path.open("w", newline="", encoding="utf-8") as metrics_file:
+    append_metrics = resuming_infusion and metrics_path.is_file() and metrics_path.stat().st_size > 0
+    with metrics_path.open("a" if append_metrics else "w", newline="", encoding="utf-8") as metrics_file:
         writer = csv.DictWriter(metrics_file, fieldnames=METRIC_FIELDS)
-        writer.writeheader()
+        if not append_metrics:
+            writer.writeheader()
 
-        for step, (inputs, targets) in enumerate(repeat_loader(train_loader), start=1):
+        for step, (inputs, targets) in enumerate(repeat_loader(train_loader), start=start_step):
             if step > config.iterations:
                 break
 
@@ -582,6 +720,10 @@ def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
             if not should_evaluate:
                 continue
 
+            validation = (
+                evaluate(model, validation_loader, device, relaxed=False)
+                if infusion_controller is not None else None
+            )
             discrete = evaluate(model, test_loader, device, relaxed=False)
             relaxed = evaluate(model, test_loader, device, relaxed=True)
             train_relaxed = evaluate(
@@ -608,6 +750,8 @@ def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
                 "train_phase": running_phase / running_examples,
                 "train_loss_relaxed": train_relaxed["loss"],
                 "train_acc_relaxed": train_relaxed["acc"],
+                "validation_loss_discrete": validation["loss"] if validation is not None else None,
+                "validation_acc_discrete": validation["acc"] if validation is not None else None,
                 "test_loss_discrete": discrete["loss"],
                 "test_acc_discrete": discrete["acc"],
                 "test_loss_relaxed": relaxed["loss"],
@@ -619,6 +763,63 @@ def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
             writer.writerow(row)
             metrics_file.flush()
             final_metrics = row
+            infusion_event = None
+            if infusion_controller is not None:
+                decision = infusion_controller.observe(
+                    step=step, accuracy=validation["acc"], loss=validation["loss"],
+                )
+                if decision.action == "advance":
+                    # The saved controller state still describes the lower, known-safe level.
+                    infusion_controller.prepare_safe_point(
+                        step=step, accuracy=validation["acc"], loss=validation["loss"],
+                    )
+                    save_infusion_checkpoint(
+                        infusion_safe_path, step=step, model=model, optimizer=optimizer,
+                        compact_controller=compact_controller,
+                        infusion_controller=infusion_controller, config=config,
+                        metrics=row, dense_freezer=dense_freezer,
+                    )
+                    infusion_controller.advance(decision)
+                    infusion_event = {
+                        "step": step, "event": "advance",
+                        "from_level": decision.from_level, "to_level": decision.to_level,
+                        "validation_accuracy": decision.accuracy,
+                        "validation_loss": decision.loss,
+                        "safe_accuracy": infusion_controller.safe_accuracy,
+                        "safe_loss": infusion_controller.safe_loss,
+                        "reason": decision.reason, "checkpoint": str(infusion_safe_path),
+                    }
+                elif decision.action == "rollback":
+                    load_infusion_checkpoint(
+                        infusion_safe_path, model=model, optimizer=optimizer,
+                        compact_controller=compact_controller,
+                        infusion_controller=infusion_controller,
+                        dense_freezer=dense_freezer, map_location=device,
+                    )
+                    infusion_controller.reset_after_rollback(step=step)
+                    infusion_event = {
+                        "step": step, "event": "rollback",
+                        "from_level": decision.from_level, "to_level": decision.to_level,
+                        "validation_accuracy": decision.accuracy,
+                        "validation_loss": decision.loss,
+                        "safe_accuracy": infusion_controller.safe_accuracy,
+                        "safe_loss": infusion_controller.safe_loss,
+                        "reason": decision.reason, "checkpoint": str(infusion_safe_path),
+                    }
+                if infusion_event is not None:
+                    with infusion_log_path.open("a", newline="", encoding="utf-8") as handle:
+                        csv.DictWriter(handle, fieldnames=INFUSION_TRANSITION_FIELDS).writerow(
+                            infusion_event
+                        )
+                    print(
+                        f"  infusion {infusion_event['event']} step={step} "
+                        f"level={infusion_event['from_level']}->{infusion_event['to_level']} "
+                        f"validation_acc={validation['acc']:.4f} "
+                        f"validation_loss={validation['loss']:.4f}"
+                    )
+            accepted_evaluation = not (
+                infusion_event is not None and infusion_event["event"] == "rollback"
+            )
             if compact_controller is not None:
                 compact_status = compact_controller.summary()
                 with (run_dir / "compact.csv").open("a", newline="", encoding="utf-8") as handle:
@@ -642,27 +843,36 @@ def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
                     dense_status = dense_freezer.summary()
                     print(f"  dense_freeze next_layer={dense_status['next_layer']} "
                           f"frozen_rows={dense_status['layers']}")
-                if config.save_model and (best_compact_step is None or discrete["acc"] > best_discrete_accuracy):
+                if (config.save_model and accepted_evaluation
+                        and (best_compact_step is None or discrete["acc"] > best_discrete_accuracy)):
                     best_compact_step = step
                     torch.save({
                         "step": step, "model_state": model.state_dict(),
                         "optimizer_state": optimizer.state_dict(),
                         "controller_state": compact_controller.state_dict(),
+                        **({"infusion_state": infusion_controller.state_dict()}
+                           if infusion_controller is not None else {}),
                         **({"dense_freezer_state": dense_freezer.state_dict()} if dense_freezer is not None else {}),
                         "config": config.to_dict(), "metrics": row,
                         "torch_rng_state": torch.get_rng_state(),
                         "cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
                     }, run_dir / "best_model.pt")
-            best_discrete_accuracy = max(
-                best_discrete_accuracy, discrete["acc"]
-            )
+            if accepted_evaluation:
+                best_discrete_accuracy = max(
+                    best_discrete_accuracy, discrete["acc"]
+                )
 
+            validation_text = (
+                f"validation_acc_discrete={validation['acc']:.4f} "
+                if validation is not None else ""
+            )
             print(
                 f"  step={step:5d} lr={learning_rate:.6f} "
                 f"temp={temperature:.3f} "
                 f"phase_weight={phase_weight:.4f} "
                 f"train_loss_relaxed={train_relaxed['loss']:.4f} "
                 f"train_acc_relaxed={train_relaxed['acc']:.4f} "
+                f"{validation_text}"
                 f"test_acc_discrete={discrete['acc']:.4f} "
                 f"test_acc_relaxed={relaxed['acc']:.4f} "
                 f"gap={row['accuracy_gap']:+.4f}"
@@ -693,6 +903,8 @@ def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
         summary["compact"] = compact_controller.summary()
     if dense_freezer is not None:
         summary["dense_freezing"] = dense_freezer.summary()
+    if infusion_controller is not None:
+        summary["progressive_aggressive_infusion"] = infusion_controller.summary()
     _write_json(run_dir / "summary.json", summary)
     if config.save_model:
         torch.save(model.state_dict(), run_dir / "final_model.pt")
