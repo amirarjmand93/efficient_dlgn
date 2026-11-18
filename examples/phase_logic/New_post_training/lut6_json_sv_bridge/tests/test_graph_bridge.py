@@ -1,5 +1,6 @@
 """Exact teacher graph compilation and compressed ROM regression checks."""
 
+import csv
 import json
 from pathlib import Path
 import shutil
@@ -57,9 +58,16 @@ def test_graph_compression_and_exact_scores(tmp_path):
     manifest = build(path, tmp_path / "project", random_tests=2)
     assert manifest["distinct_truth_tables"] == 3
     assert manifest["reference_scores"][0] == [3, 2]
+    assert manifest["memory_shapes"]["rec2"]["width_bits"] == 2 * spec["addr_w"] + 4
+    assert manifest["memory_shapes"]["sum_addr"] == {
+        "width_bits": spec["addr_w"] + 1, "depth": len(spec["sums"])
+    }
+    assert "sum_inv" not in manifest["memory_shapes"]
     rtl = (tmp_path / "project/rtl/lut6_sequential.sv").read_text()
     assert "__" not in rtl
     assert "sum_addr_mem" in rtl and "values_mem" in rtl
+    assert not (tmp_path / "project/rtl/lut6_sum_inv.mem").exists()
+    assert (tmp_path / "project/report_inference/generate.py").exists()
 
 
 def test_rejects_forward_reference():
@@ -82,7 +90,9 @@ def test_graph_argmax_output(tmp_path, classes, width):
     ir = tmp_path / "teacher.json"
     ir.write_text(json.dumps(graph))
     out = tmp_path / "project"
-    manifest = build(ir, out, random_tests=0)
+    clock_ns = 8.0 if classes == 13 else 10.0
+    manifest = build(ir, out, random_tests=0, clock_ns=clock_ns)
+    assert manifest["simulation_clock_ns"] == clock_ns
     assert manifest["class_width_bits"] == width
     assert manifest["reference_predictions"][:2] == [0, 2]
     assert predicted_class([3, 5, 5]) == 1
@@ -97,6 +107,13 @@ def test_graph_argmax_output(tmp_path, classes, width):
                                 capture_output=True, text=True, timeout=120)
         assert result.returncode == 0, result.stdout + result.stderr
         assert "ALL_TESTS_PASS" in (out / "simulation.log").read_text()
+        summary = (out / "report_inference/summary.md").read_text()
+        assert f"{clock_ns} ns" in summary
+        with (out / "report_inference/latency.csv").open() as file:
+            rows = list(csv.DictReader(file))
+        assert len(rows) == 3
+        assert all(int(row["input_to_prediction_cycles"])
+                   - int(row["start_to_prediction_cycles"]) == 3 for row in rows)
 
 
 def test_graph_debug_scores_port(tmp_path):

@@ -13,12 +13,14 @@ import json
 import math
 from pathlib import Path
 import random
+import shutil
 
 from .compiler import IRValidationError, require
 
 
 BASE = Path(__file__).resolve().parents[1]
 TEMPLATE = BASE / "rtl" / "lut6_graph_engine.sv.in"
+REPORT_GENERATOR = Path(__file__).with_name("inference_report.py")
 
 
 def _bits(count):
@@ -166,17 +168,21 @@ def _bram_estimate(width, depth):
 def write_roms(spec, out):
     rtl = out / "rtl"
     rtl.mkdir(parents=True, exist_ok=True)
+    (rtl / "lut6_sum_inv.mem").unlink(missing_ok=True)
     counts = Counter(len(pins) for pins, _ in spec["instructions"])
     kind = [len(pins) - 1 for pins, _ in spec["instructions"]]
     _hex_lines(rtl / "lut6_kind.mem", kind, 3)
     memories = {"kind": (3, len(kind))}
     for arity in range(1, 7):
-        width = arity * spec["addr_w"] + spec["id_w"]
+        # Two-input gates need only four truth bits; storing them beside their
+        # addresses avoids a wide shared-truth-ROM lookup for these gates.
+        width = arity * spec["addr_w"] + (4 if arity == 2 else spec["id_w"])
         words = []
         for pins, truth_id in spec["instructions"]:
             if len(pins) != arity:
                 continue
-            word = truth_id << (arity * spec["addr_w"])
+            truth_field = (spec["truth_tables"][truth_id] & 0xF) if arity == 2 else truth_id
+            word = truth_field << (arity * spec["addr_w"])
             for index, source in enumerate(pins):
                 word |= source << (index * spec["addr_w"])
             words.append(word)
@@ -184,17 +190,12 @@ def write_roms(spec, out):
         memories[f"rec{arity}"] = (width, max(1, len(words)))
     _hex_lines(rtl / "lut6_truth.mem", spec["truth_tables"], 64)
     memories["truth"] = (64, len(spec["truth_tables"]))
-    addresses = [source for source, _ in spec["sums"]]
-    packed_addr = [addresses[i] | ((addresses[i + 1] if i + 1 < len(addresses) else 0)
-                                    << spec["addr_w"])
-                   for i in range(0, len(addresses), 2)]
-    _hex_lines(rtl / "lut6_sum_addr.mem", packed_addr, 2 * spec["addr_w"])
-    memories["sum_addr"] = (2 * spec["addr_w"], len(packed_addr))
-    inverted = [int(value) for _, value in spec["sums"]]
-    packed_inv = [sum(inverted[i + j] << j for j in range(min(16, len(inverted) - i)))
-                  for i in range(0, len(inverted), 16)]
-    _hex_lines(rtl / "lut6_sum_inv.mem", packed_inv, 16)
-    memories["sum_inv"] = (16, len(packed_inv))
+    # One word per reduction input: source address in the low bits, followed
+    # by its inversion bit. This removes the separate inversion ROM.
+    sum_words = [source | (int(inverted) << spec["addr_w"])
+                 for source, inverted in spec["sums"]]
+    _hex_lines(rtl / "lut6_sum_addr.mem", sum_words, spec["addr_w"] + 1)
+    memories["sum_addr"] = (spec["addr_w"] + 1, len(sum_words))
     memories["values"] = (1, spec["n_values"])
     return memories, counts
 
@@ -218,16 +219,15 @@ def verify_rom_roundtrip(spec, out):
         pointers[arity] += 1
         decoded = tuple((word >> (slot * spec["addr_w"])) & mask
                         for slot in range(arity))
-        decoded_id = word >> (arity * spec["addr_w"])
-        require((decoded, decoded_id) == (pins, truth_id),
-                f"Gate {index} connection or truth ID differs in ROM")
+        decoded_truth = word >> (arity * spec["addr_w"])
+        expected_truth = (spec["truth_tables"][truth_id] & 0xF) if arity == 2 else truth_id
+        require((decoded, decoded_truth) == (pins, expected_truth),
+                f"Gate {index} connection or truth differs in ROM")
     addr_words = [int(line, 16) for line in
                   (rtl / "lut6_sum_addr.mem").read_text().splitlines()]
-    inv_words = [int(line, 16) for line in
-                 (rtl / "lut6_sum_inv.mem").read_text().splitlines()]
     for index, expected in enumerate(spec["sums"]):
-        source = (addr_words[index // 2] >> ((index % 2) * spec["addr_w"])) & mask
-        inverted = bool((inv_words[index // 16] >> (index % 16)) & 1)
+        source = addr_words[index] & mask
+        inverted = bool((addr_words[index] >> spec["addr_w"]) & 1)
         require((source, inverted) == expected,
                 f"GroupSum entry {index} differs in ROM")
 
@@ -261,7 +261,7 @@ def render_rtl(spec, out, *, debug_scores=False):
     advance_code = []
     for arity in range(1, 7):
         index = arity - 1
-        width = arity * spec["addr_w"] + spec["id_w"]
+        width = arity * spec["addr_w"] + (4 if arity == 2 else spec["id_w"])
         length = max(1, sum(len(pins) == arity for pins, _ in spec["instructions"]))
         record_code.append(f'''    (* rom_style="block" *) reg [{width-1}:0] rec{arity}_mem[0:{length-1}];
     reg [{width-1}:0] rec{arity}_q;
@@ -286,7 +286,7 @@ def render_rtl(spec, out, *, debug_scores=False):
     (out / "rtl" / "lut6_sequential.sv").write_text(text)
 
 
-def render_tb(spec, patterns, scores, out, *, debug_scores=False):
+def render_tb(spec, patterns, scores, out, *, clock_ns=10.0, debug_scores=False):
     vectors = out / "vectors"
     vectors.mkdir(exist_ok=True)
     for index, pattern in enumerate(patterns):
@@ -313,7 +313,9 @@ module tb_lut6_sequential;
   reg [CLASS_W-1:0] golden_class[0:N_CASES-1];
 {f'  reg [SCORE_W*N_CLASSES-1:0] golden[0:N_CASES-1];' if debug_scores else ''}
   integer test_id, i;
-  always #5 clk=~clk;
+  real input_start_ns, inference_start_ns;
+  localparam real CLOCK_NS={clock_ns:g};
+  always #(CLOCK_NS/2.0) clk=~clk;
   lut6_sequential dut(.*);
   initial begin
     $readmemh("vectors/golden_class.mem",golden_class);
@@ -328,10 +330,11 @@ module tb_lut6_sequential;
         @(negedge clk);
         if (!input_ready) $fatal(1,"Input not ready");
         input_valid=1; input_bit=bits[i];
+        if (i==0) input_start_ns=$realtime+CLOCK_NS/2.0;
       end
       @(negedge clk); input_valid=0;
       if (!frame_ready) $fatal(1,"Frame not ready");
-      start=1;
+      start=1; inference_start_ns=$realtime+CLOCK_NS/2.0;
       @(negedge clk); start=0;
       wait(done===1'b1);
       if (pred_valid !== 1'b1)
@@ -341,6 +344,8 @@ module tb_lut6_sequential;
 {'''      if (scores_flat !== golden[test_id])
         $fatal(1,"Score mismatch case=%0d got=%h want=%h",test_id,scores_flat,golden[test_id]);''' if debug_scores else ''}
       $display("PASS case=%0d",test_id);
+      $display("INFERENCE_CASE case=%0d input_to_pred_ns=%0.3f start_to_pred_ns=%0.3f",
+               test_id, $realtime-input_start_ns, $realtime-inference_start_ns);
       @(negedge clk);
       @(negedge clk);
       if (pred_valid !== 1'b0)
@@ -358,6 +363,11 @@ endmodule
 
 def write_support(out, clock_ns):
     (out / "timing.xdc").write_text(f"create_clock -name core_clk -period {clock_ns:g} [get_ports clk]\n")
+    report = out / "report_inference"
+    report.mkdir(exist_ok=True)
+    for name in ("latency.csv", "summary.md"):
+        (report / name).unlink(missing_ok=True)
+    shutil.copyfile(REPORT_GENERATOR, report / "generate.py")
     vivado = out / "vivado"
     vivado.mkdir(exist_ok=True)
     (vivado / "implement.tcl").write_text('''# vivado -mode batch -source vivado/implement.tcl -tclargs <part> <tag>
@@ -371,8 +381,8 @@ file mkdir $outdir
 create_project -force "teacher_lut6_$tag" [file join $root vivado_build_$tag] -part $part
 add_files -norecurse [file join $root rtl lut6_sequential.sv]
 set mem_files [glob [file join $root rtl *.mem]]
-if {[llength $mem_files] != 10} {
-    error "Expected all ten LUT6 ROM initialization files"
+if {[llength $mem_files] != 9} {
+    error "Expected all nine LUT6 ROM initialization files"
 }
 foreach mem $mem_files {
     add_files -norecurse $mem
@@ -422,12 +432,14 @@ write_checkpoint -force [file join $outdir routed_design.dcp]
     (out / "run_sim.sh").write_text('''#!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")"
+rm -f report_inference/latency.csv report_inference/summary.md
 for mem in rtl/*.mem; do cp "$mem" "$(basename "$mem")"; done
 xvlog -sv rtl/lut6_sequential.sv sim/tb_lut6_sequential.sv
 xelab tb_lut6_sequential -s graph_tb_snapshot
 xsim graph_tb_snapshot -runall -log simulation.log
 grep -q 'PREDICTIONS_PASS' simulation.log
 grep -q 'ALL_TESTS_PASS' simulation.log
+python3 report_inference/generate.py
 ''')
     (out / "run_sim.sh").chmod(0o755)
 
@@ -453,12 +465,14 @@ def build(ir_path, out, *, random_tests=1, seed=42, clock_ns=10.0,
         expected, actual = evaluate_native(ir, bits), evaluate_program(spec, bits)
         require(actual == expected, "Teacher JSON and compressed program differ")
         scores.append(actual)
-    render_tb(spec, patterns, scores, out, debug_scores=debug_scores)
+    render_tb(spec, patterns, scores, out, clock_ns=clock_ns,
+              debug_scores=debug_scores)
     write_support(out, clock_ns)
     rom_bits = sum(width * depth for name, (width, depth) in memories.items() if name != "values")
     manifest = dict(format="teacher_lut6_graph_sv_v1", input_shape=spec["shape"],
                     input_bits=n, graph_nodes=spec["n_program"], classes=spec["n_classes"],
                     score_width_bits=spec["score_w"], class_width_bits=spec["class_w"],
+                    simulation_clock_ns=clock_ns,
                     debug_scores_output=debug_scores,
                     reference_predictions=[predicted_class(score) for score in scores],
                     distinct_truth_tables=len(spec["truth_tables"]),

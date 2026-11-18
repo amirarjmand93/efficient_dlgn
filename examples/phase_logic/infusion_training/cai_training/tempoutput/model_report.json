@@ -1,0 +1,96 @@
+{
+  "infusion_profile": "strong_unary",
+  "logic_layer_widths": [
+    {
+      "layer": "1",
+      "lut_node_applications": 32768,
+      "output_wires": 32768,
+      "shared_lut_nodes": 128,
+      "training_candidates_per_node": 16,
+      "type": "CompactConv",
+      "width": 32768
+    },
+    {
+      "layer": "2",
+      "lut_node_applications": 32768,
+      "output_wires": 32768,
+      "shared_lut_nodes": 128,
+      "training_candidates_per_node": 16,
+      "type": "CompactConv",
+      "width": 32768
+    },
+    {
+      "layer": "3",
+      "lut_node_applications": 32768,
+      "output_wires": 32768,
+      "shared_lut_nodes": 512,
+      "training_candidates_per_node": 16,
+      "type": "CompactConv",
+      "width": 32768
+    },
+    {
+      "layer": "4",
+      "lut_node_applications": 32768,
+      "output_wires": 32768,
+      "shared_lut_nodes": 512,
+      "training_candidates_per_node": 16,
+      "type": "CompactConv",
+      "width": 32768
+    },
+    {
+      "layer": "6",
+      "lut_node_applications": 92400,
+      "output_wires": 92400,
+      "shared_lut_nodes": 92400,
+      "training_candidates_per_node": 16,
+      "type": "CompactDense",
+      "width": 92400
+    },
+    {
+      "layer": "7",
+      "lut_node_applications": 92400,
+      "output_wires": 92400,
+      "shared_lut_nodes": 92400,
+      "training_candidates_per_node": 16,
+      "type": "CompactDense",
+      "width": 92400
+    }
+  ],
+  "model_variant": "build_model_cifar10_small_compact",
+  "parameter_count": 2977280,
+  "source_thresholds": [
+    [
+      0.364705890417099,
+      0.6039215922355652
+    ],
+    [
+      0.35686275362968445,
+      0.5882353186607361
+    ],
+    [
+      0.29411765933036804,
+      0.5490196347236633
+    ]
+  ],
+  "target_draw_mixtures": {
+    "conv1_to_3": {
+      "and_or": 0.25,
+      "uniform": 0.75
+    },
+    "conv4": {
+      "uniform": 1.0
+    },
+    "dense1": {
+      "constant": 0.05,
+      "identity": 0.7,
+      "inversion": 0.15,
+      "uniform": 0.10000000000000009
+    },
+    "dense2": {
+      "constant": 0.05,
+      "identity": 0.6,
+      "inversion": 0.15,
+      "uniform": 0.20000000000000007
+    }
+  }
+}

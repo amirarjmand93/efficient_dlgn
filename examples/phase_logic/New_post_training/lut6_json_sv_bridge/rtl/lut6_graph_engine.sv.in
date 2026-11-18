@@ -22,8 +22,7 @@ module lut6_sequential(
     localparam integer SCORE_W=__SCORE_W__, CLASS_W=__CLASS_W__;
     localparam integer SUM_W=__SUM_W__, PC_W=__PC_W__, LOAD_W=__LOAD_W__;
     localparam integer REC_MAX_W=6*ADDR_W+ID_W;
-    localparam integer SUM_ADDR_DEPTH=(N_SUM+1)/2;
-    localparam integer SUM_INV_DEPTH=(N_SUM+15)/16;
+    localparam integer SUM_ADDR_DEPTH=N_SUM;
 
     localparam [4:0] S_LOAD=0, S_READY=1, S_KIND=2, S_REC=3,
                      S_TRUTH=4, S_PIN=5, S_MEM=6, S_SAMPLE=7,
@@ -39,8 +38,7 @@ module lut6_sequential(
     reg [63:0] truth_q;
     reg [SUM_W-1:0] sum_index, class_pos;
     reg [CLASS_W-1:0] class_index;
-    reg [2*ADDR_W-1:0] sum_pair_q;
-    reg [15:0] sum_inv_word_q;
+    reg [ADDR_W:0] sum_entry_q;
     reg sum_inv_q;
     reg [SCORE_W-1:0] class_counts[0:N_CLASSES-1];
 
@@ -112,19 +110,14 @@ __RECORD_SELECT__
 
     (* rom_style="block" *) reg [63:0] truth_mem[0:N_TRUTH-1];
     initial $readmemh("lut6_truth.mem", truth_mem);
-    always @(posedge clk) if (state==S_TRUTH) truth_q <= truth_mem[truth_id];
+    always @(posedge clk) if (state==S_TRUTH && kind_q!=3'd1)
+        truth_q <= truth_mem[truth_id];
 
-    (* rom_style="block" *) reg [2*ADDR_W-1:0]
+    (* rom_style="block" *) reg [ADDR_W:0]
         sum_addr_mem[0:SUM_ADDR_DEPTH-1];
-    (* rom_style="block" *) reg [15:0] sum_inv_mem[0:SUM_INV_DEPTH-1];
-    initial begin
-        $readmemh("lut6_sum_addr.mem",sum_addr_mem);
-        $readmemh("lut6_sum_inv.mem",sum_inv_mem);
-    end
-    always @(posedge clk) if(state==S_SUM_FETCH) begin
-        sum_pair_q <= sum_addr_mem[sum_index >> 1];
-        sum_inv_word_q <= sum_inv_mem[sum_index >> 4];
-    end
+    initial $readmemh("lut6_sum_addr.mem",sum_addr_mem);
+    always @(posedge clk) if(state==S_SUM_FETCH)
+        sum_entry_q <= sum_addr_mem[sum_index];
 
     // One randomly addressed bit store retains graph values until no longer
     // needed. No reset on this memory, so it can infer BRAM.
@@ -132,7 +125,8 @@ __RECORD_SELECT__
     wire value_we=(state==S_LOAD && input_valid) || state==S_EXEC;
     wire [ADDR_W-1:0] value_write_addr =
         state==S_LOAD ? load_index : (N_INPUT+pc);
-    wire value_write_bit = state==S_LOAD ? input_bit : truth_q[lut_addr];
+    wire value_write_bit = state==S_LOAD ? input_bit :
+        (kind_q==3'd1 ? rec2_q[2*ADDR_W + lut_addr[1:0]] : truth_q[lut_addr]);
     always @(posedge clk) begin
         if(value_we) values_mem[value_write_addr] <= value_write_bit;
         if(state==S_MEM || state==S_SUM_MEM)
@@ -217,9 +211,8 @@ __RECORD_ADVANCE__
             end
             S_SUM_FETCH: state<=S_SUM_ADDR;
             S_SUM_ADDR: begin
-                read_addr<=sum_index[0] ? sum_pair_q[2*ADDR_W-1:ADDR_W]
-                                        : sum_pair_q[ADDR_W-1:0];
-                sum_inv_q<=sum_inv_word_q[sum_index & 4'hF];
+                read_addr<=sum_entry_q[ADDR_W-1:0];
+                sum_inv_q<=sum_entry_q[ADDR_W];
                 state<=S_SUM_MEM;
             end
             S_SUM_MEM: state<=S_SUM_ACC;

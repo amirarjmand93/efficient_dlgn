@@ -1,0 +1,13 @@
+{
+  "description": "Existing CIFAR-10 CAI result; kept in its original location.",
+  "runs": [
+    {
+      "dataset": "cifar10",
+      "model_variant": "build_model_cifar10_small_compact",
+      "infusion_profile": "strong_unary",
+      "initial_alpha": 0.95,
+      "seed": 424244921,
+      "path": "examples/phase_logic/infusion_training/new_continous_infusion/results/aggressive_cifar10_compact_plain_cai_strong_unary_seed424244921_al95_absolute_down005_eval50000"
+    }
+  ]
+}

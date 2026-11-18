@@ -13,9 +13,9 @@ flowchart TD
     A["Teacher checkpoint: best_model.pt"] --> B["teacher_lut6_exporter.py"]
     B --> C["outputs/teacher_plain_seed_424244921/lut6_ir.json"]
     C --> D["graph_compiler.py"]
-    D --> E["graph_sv_7035/rtl/: lut6_sequential.sv + 10 .mem files"]
+    D --> E["graph_sv_7035/rtl/: lut6_sequential.sv + 9 .mem files"]
     D --> F["graph_sv_7035/sim/ + vectors/: testbench + golden scores"]
-    E --> G["run_sim.sh: compare 10 class scores"]
+    E --> G["run_sim.sh: verify prediction and measure latency"]
     F --> G
     E --> H["vivado/implement.tcl: synthesize, place, route"]
     H --> I["reports_z7035/: utilization, route status, timing, routed_design.dcp"]
@@ -38,7 +38,8 @@ env PYTHONPATH=src:. python -m examples.phase_logic.New_post_training.teacher_lu
 
 The exporter loads the checkpoint on CPU, extracts its discrete Boolean
 circuit, propagates constants, simplifies gates, removes duplicates and dead
-gates, then packs eligible connected cones into LUT6 nodes. The JSON format is
+gates, then packs eligible connected cones into LUT6 nodes. This project's
+packed LUT6 graph JSON uses the compatibility format identifier
 `torchlogix_native_lut6_circuit_v1`: each node has six input descriptors and
 a 64-bit truth table (`init_hex`), followed by exact integer GroupSum class
 reductions. Pin 0 is the LUT address LSB. Skip edges, repeated GroupSum inputs,
@@ -99,14 +100,14 @@ self-checking testbench, `manifest.json`, and a Vivado Tcl script. Its ROMs
 hold node arities, connection addresses, shared LUT truth tables, and GroupSum
 references. One bit RAM stores the encoded input and intermediate node values.
 The RTL reads ROM files by filename from its `rtl/` source directory; include
-**all ten `.mem` files** when moving the project to another machine.
+**all nine `.mem` files** when moving the project to another machine.
 
 ```mermaid
 flowchart LR
     A["lut6_ir.json<br/>topologically ordered LUT6 graph"] --> B["Validate graph<br/>connections + pin order + GroupSum"]
     B --> C["Compact instructions<br/>group by active-pin count<br/>normalize pin inversion"]
     C --> D["Share identical INITs<br/>pack GroupSum addresses + inversion bits"]
-    D --> E["graph_sv_7035/rtl/<br/>sequential engine + 10 ROM files"]
+    D --> E["graph_sv_7035/rtl/<br/>sequential engine + 9 ROM files"]
     D --> F["graph_sv_7035/sim/ + vectors/<br/>testbench + expected scores"]
     E --> G["XSim functional check"]
     F --> G
@@ -136,10 +137,13 @@ source /home/j3k9j/AMD/2026.1/Vivado/settings64.sh
 ./run_sim.sh
 ```
 
-The testbench streams each input bit, waits for `done`, and compares all ten
-raw integer scores. The current teacher project passed four XSim vectors
-(`ALL_TESTS_PASS cases=4`). These are sampled functional checks, not a formal
-proof or a post-route simulation.
+The testbench streams each input bit, waits for `done`, and checks the predicted
+class. With `--debug-scores`, it also checks all raw integer scores. After a
+passing run, `report_inference/summary.md` and `report_inference/latency.csv`
+record latency in clock cycles and simulated time, both from `start` and from
+the first streamed input bit. The testbench uses the `--clock-ns` period supplied
+to the graph compiler (10 ns by default). These sampled checks are not a formal
+proof or a post-route timing measurement.
 
 ## 4. Synthesize and route
 

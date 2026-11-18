@@ -17,6 +17,8 @@ experiments/results/
 data/
 examples/data/
 examples/phase_logic/results/
+/examples/phase_logic/infusion_training/cai_training/results/
+related_works_pdf/
 torchlogix-project.tar.gz
 __pycache__/
 *.pyc
