@@ -16,6 +16,8 @@ def main():
     parser.add_argument("--seeds", nargs="+", type=int, default=[424244921])
     parser.add_argument("--infusion-profile", choices=("default", "strong_unary", "ultra_unary"),
                         default="strong_unary")
+    parser.add_argument("--fixed-alpha", action="store_true",
+                        help="Keep alpha fixed while retaining candidate resampling.")
     parser.add_argument("--iterations", type=int)
     parser.add_argument("--exploration-steps", type=int)
     parser.add_argument("--eval-frequency", type=int)
@@ -29,6 +31,17 @@ def main():
                            "--dataset", dataset, "--seed", str(seed),
                            "--initial-alpha", str(alpha),
                            "--infusion-profile", args.infusion_profile]
+                if args.fixed_alpha:
+                    command.extend(("--step-up", "0", "--step-down", "0"))
+                    base_output = prepare_config(
+                        build_parser().parse_args(command[3:])
+                    )[2]
+                    fixed_output = (
+                        base_output.parent.parent.parent /
+                        f"{args.infusion_profile}_fixed_alpha" /
+                        base_output.parent.name / base_output.name
+                    )
+                    command.extend(("--output-dir", str(fixed_output)))
                 for name in ("iterations", "exploration_steps", "eval_frequency"):
                     value = getattr(args, name)
                     if value is not None:

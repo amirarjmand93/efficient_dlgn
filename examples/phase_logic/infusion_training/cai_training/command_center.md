@@ -66,6 +66,25 @@ Results go to separate
 directories. Completed runs are skipped; an incomplete existing run stops the
 sweep for inspection. The `strong_unary` directories are untouched.
 
+## Fixed-alpha overnight sweep
+
+This control keeps candidate resampling enabled while disabling α feedback.
+The three initial α values remain fixed at 0.3, 0.6, and 0.9. Results use
+separate `strong_unary_fixed_alpha` directories and cannot overwrite adaptive
+runs.
+
+Inspect the planned runs:
+
+```bash
+python -m examples.phase_logic.infusion_training.cai_training.nightly --fixed-alpha --infusion-profile strong_unary --alphas 0.3 0.6 0.9 --seeds 424244921 --iterations 1200000 --exploration-steps 600000 --eval-frequency 50000 --dry-run
+```
+
+Start the sequential sweep:
+
+```bash
+python -m examples.phase_logic.infusion_training.cai_training.nightly --fixed-alpha --infusion-profile strong_unary --alphas 0.3 0.6 0.9 --seeds 424244921 --iterations 1200000 --exploration-steps 600000 --eval-frequency 50000
+```
+
 ## Run one dataset
 
 Change `--initial-alpha` to `0.3`, `0.6`, `0.9`, or another value in `[0,1]`.

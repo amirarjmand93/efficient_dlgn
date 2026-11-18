@@ -29,7 +29,7 @@ class ContinuousAdaptiveInfusion:
                   accuracy_tolerance, rollback_drop)
         if exploration_steps <= 0 or any(not math.isfinite(value) for value in values):
             raise ValueError("CAI feedback settings must be finite and exploration positive.")
-        if not 0 <= initial_alpha <= 1 or not 0 < step_up < 1 or not 0 < step_down < 1:
+        if not 0 <= initial_alpha <= 1 or not 0 <= step_up < 1 or not 0 <= step_down < 1:
             raise ValueError("CAI alpha and response fractions are out of range.")
         if step_down_mode not in {"fractional", "absolute"}:
             raise ValueError("CAI step-down mode must be fractional or absolute.")
